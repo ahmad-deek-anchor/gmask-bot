@@ -381,6 +381,7 @@ tabs are hand-built with merged group headers and blank spacer columns):
 | `Financing Fees` | `Month | HOLD Financing Fees | HOLD Delta Sales | Total` + a weekly block; no as-of cell (the tool prints the dashboard's) | `get_financing_fees(months=6)` |
 | `Nonclient PNL` | only a title and a link to a separate "HOLD PNL" spreadsheet the agent cannot read | `get_nonclient_pnl(months=6)` (says so) |
 | `db` | trade blotter `Date (UTC) | Counterparty | Side | Symbol | Buy QTY | Buy Asset | Sell QTY | Sell Asset | Price | PNL | Currency | bps | Month` | `get_counterparty_pnl(days=30, top_n=15, counterparty=None, by="counterparty"|"symbol"|"side")` |
+| `A1 database` (cols R:X only) | row 1 headers `Client Flow PNL | Non Client Flow PNL | Change in Total PNL | Change in Client Flow PNL | Change in non Client Flow PNL` in T:X (R1:S9 is an unrelated asset list); rows 2-224 undated history; from row 225 (2025-07-24) R = snapshot datetime `YYYY-MM-DD HH:MM:SS`, S/T/U = cumulative YTD total / client / non-client realised PnL (reset Jan 1), V/W/X = that day's realised total / client-flow / non-client-flow PnL. Some dates missing (e.g. 2026-09-04), one date with two snapshots, offsetting artefact pairs (e.g. 2025-08-14/15 +/-$12.0M) that the weekly tab includes net | `get_a1_client_flow_split(start_date, end_date=None, include_daily=True)` - window sums with % split, per-day table (monthly subtotals for long windows), missing days, artefact disclosure (a pair inside the window is kept and netted; a lone leg is excluded), cross-check vs `Weekly PNL` A1 Realized when the window is a dashboard week and vs the cumulative S/T/U columns for YTD; shortcuts `last week`, `this week`, `mtd`, `ytd`, `last month`, `last N days` resolved against the data-as-of date. Verified 2026-09-11: Sep 4-10 2026 (week 36) V $296,548 = W $68,187 + X $228,361, weekly tab $296,548 |
 | any | raw cells, capped at 200 rows x 30 columns | `list_a1_dashboard_tabs()`, `read_a1_dashboard_range(tab, a1_range)` |
 
 All tools print the tab's "Data as of" date and the source line, format USD with `$` and
@@ -400,7 +401,8 @@ cell `'Volume & PNL'!N16` = 13,622,125.72 = sum of the monthly TOTAL PnL cells =
 Tests: `tests/test_gsheets.py` (parsers on canned `values` payloads modelled on the real
 rows, auth headers, 401 refresh, 403 / 404 / 429 messages, cache TTL, factory) and
 `tests/test_sheet_tools.py` (every tool's markdown, unavailable / error paths, `by` variants,
-the range cap) - no network, no GCP.
+the range cap, the client-flow split: shortcuts, artefacts, missing days, cross-checks) - no
+network, no GCP.
 
 ## Long-term memory
 
@@ -411,8 +413,8 @@ The chat agent and the Slack bot share a small persistent memory (`providers/mem
 e.g. `sqlite:///data/memory.db`; `postgresql://...` is accepted for Cloud Run and needs
 `pip install 'psycopg[binary]'`, otherwise a clear `NotImplementedError`). Table `memories`
 (`id, namespace, key, text, meta JSON, created_at, updated_at, expires_at, embedding BLOB`) with
-four namespaces, plus the `snapshots` table used by `snapshot_daily.py` (see
-[Data snapshots](#data-snapshots)):
+four namespaces, plus the `snapshots` table used by `snapshot_daily.py` when `SNAPSHOT_BACKEND=sqlite`
+(the default; production uses the shared BigQuery table, see [Data snapshots](#data-snapshots)):
 
 | Namespace | Content | Written by | TTL |
 |---|---|---|---|
@@ -525,37 +527,69 @@ run_signals.py / chat.py / slack_bot.py      entry points (CLI report, terminal 
          providers/base.py                    standard schemas: time, price | spot_volume | funding_rate (annualized %) | perp_oi | ...
        tools/memory_tools.py                  remember / recall / forget / channel rules + build_context, episode summariser
        tools/context.py                       contextvars: current_user_id / current_channel_id / current_is_dm / current_memory_context
-         providers/factory.get_memory_store() MemoryStore (providers/memory_store.py): memories + snapshots in data/memory.db
+         providers/factory.get_memory_store() MemoryStore (providers/memory_store.py): memories in data/memory.db; snapshots via SNAPSHOT_BACKEND
+           providers/snapshot_bq.py             BigQuerySnapshotBackend: MERGE/SELECT on gmask_bot.snapshots (written daily by the Cloud Run job)
   utils/llm.get_llm()                         ChatAnthropicVertex (cached per model/temperature/max_tokens)
   utils/config.Config + utils/secrets         env override -> GCP Secret Manager
   notifiers/slack                             to_mrkdwn / chunk_text, post_via_bot (bot token), post_message (env webhook)
   prompts/*.md                                system, per-token, whole-universe, chat and Slack-addendum prompts
-  deploy/                                     Cloud Run notes, systemd units (not enabled)
+  deploy/                                     Cloud Run notes, deploy_snapshot_job.sh (Cloud Run job + Scheduler), systemd units
 ```
 
 ## Data snapshots
 
-`snapshot_daily.py` records one row per (date, source, entity, metric) into the `snapshots`
-table of the memory store (`providers/memory_store.py`, env `MEMORY_DB_URL`, default
-`sqlite:///data/memory.db`), so the chat agent and the Slack bot can answer "how has X moved
-since ..." questions from our own history instead of re-deriving it. Rows are upserted, so
-re-running for the same date is a no-op apart from `captured_at`.
+`snapshot_daily.py` records one row per (date, source, entity, metric) so the chat agent and the
+Slack bot can answer "how has X moved since ..." from our own history (`tools/snapshot_tools.py`).
+Rows are upserted on that key, so re-running a day is a no-op apart from `captured_at`.
+
+### Architecture (since 2026-09-11)
+
+```
+Cloud Scheduler trading-signals-snapshot-daily  (23:30 UTC, POST jobs.run as gm-bot)
+  -> Cloud Run job trading-signals-snapshot      python snapshot_daily.py --sources signals --verbose
+       Coin Metrics + Amberdata (keys from Secret Manager)  ~85 s, 28 tokens, 370 rows
+         -> MERGE into BigQuery anchorage-corp-eng-playground.gmask_bot.snapshots
+                                                    ^
+local systemd timer (23:30 UTC, best effort)        |   same table, same MERGE
+  python snapshot_daily.py --sources haruko,sheet --+
+                                                    |
+Slack bot / chat.py (SNAPSHOT_BACKEND=bigquery) ----+   parameterised SELECTs, date-filtered
+```
+
+The developer machine sleeps, so the market-data source runs in Google Cloud; the two sources that
+need the user's own credentials stay on the local timer: the service account **cannot** read
+`anc-global-markets` (Haruko tables) and **cannot** be shared the A1 Metrics Google Sheet (domain
+policy), so `haruko` and `sheet` are captured whenever the machine is awake at 23:30 UTC.
+
+**Storage switch** (`utils/config.py`, `.env`): `SNAPSHOT_BACKEND=sqlite` (default; the `snapshots`
+table inside `MEMORY_DB_URL`) or `SNAPSHOT_BACKEND=bigquery` (`providers/snapshot_bq.py`; table
+`SNAPSHOT_BQ_TABLE`, default above; jobs run and are billed in `BQ_BILLING_PROJECT`). Memories always stay
+in the local SQLite file; only the snapshot methods of `MemoryStore` are delegated, with identical
+return shapes on both backends. The store logs `Snapshot backend: bigquery (...)` at start-up.
+
+Table: `snapshot_date DATE, source, entity, metric STRING, value FLOAT64, value_json STRING,
+captured_at TIMESTAMP`, partitioned by `snapshot_date`, clustered by `(source, entity, metric)`.
+Writes are one parameterised `MERGE ... USING UNNEST(@rows)` per batch of 500 (duplicates inside a batch
+collapse first); reads filter on `snapshot_date` wherever a window is known so scans stay tiny.
+`scripts/migrate_snapshots_to_bq.py` copied the first local day (431 rows) into the table once.
 
 ```bash
-python snapshot_daily.py                          # all three sources for today's UTC date
-python snapshot_daily.py --sources haruko,sheet   # subset
+python snapshot_daily.py                          # all three sources for today's UTC date (into the backend from .env)
+python snapshot_daily.py --sources haruko,sheet   # what the local timer runs
+python snapshot_daily.py --sources signals -v     # what the Cloud Run job runs
 python snapshot_daily.py --date 2026-09-10        # store under another date (values are still "now")
 python snapshot_daily.py --dry-run -v             # print every row, write nothing
+python scripts/migrate_snapshots_to_bq.py --dry-run   # count local sqlite rows that would be MERGEd
 ```
 
 Exit code is non-zero only when every requested source fails; one failing source never blocks
 the others. Each source logs its row count, upstream call count and duration.
 
-| Source | Entities | Metrics |
-|---|---|---|
-| `haruko` - latest `fct_otc_haruko_pnl_portfolio` row per entity (same query shape as `get_desk_risk_snapshot`) | `20` (A1 Ltd), `86` (ADSD), `combined` (sum) | `delta_usd`, `delta_adjusted_usd`, `gamma_usd`, `gamma_pct_usd`, `vega`, `theta`, `day_pnl`, `ytd_pnl`, `gross_notional`, `equity`, `valid_pricer_pct` (combined = pricer-count weighted), `data_quality_flag` (value 1 = Normal / 0 = flagged; `value_json` carries the flag text and as-of time) |
-| `signals` - `fetch_token_metrics(FULL_TOKEN_UNIVERSE, 45 days)` -> `calculate_statistical_signals` | one per token (`btc`, `eth`, ...) | `<m>` (latest value) and `<m>_z` (z-score) for `spot_volume`, `perp_volume`, `perp_oi`, `total_liquidations` and, where listed, `dvol_close`, `atm_iv_30d`, `pcr_oi`, `options_notional_volume`, `options_block_notional_volume`; `skew_25d_30d` / `pcr_volume_24h` plus `_chg7d`; `price`, `price_pct_change_1d`, `funding_rate` (annualised %). Values are as of the last complete UTC day (`value_json.as_of`). |
-| `sheet` - A1 Metrics Dashboard (`monthly_volume_pnl`, `weekly_pnl`) | `HOLD`, `A1`, `TOTAL` | `mtd_volume_usd`, `mtd_pnl_usd`, `mtd_take_rate_bps` (latest populated month <= current), `ytd_volume_usd`, `ytd_pnl_usd`, `ytd_take_rate_bps`, `ytd_target_pnl_usd` / `ytd_pct_of_target` (TOTAL), `week_pnl_usd` (latest week), `week_realized_pnl_usd` / `week_unrealized_pnl_usd` (A1) |
+| Source | Where it runs | Entities | Metrics |
+|---|---|---|---|
+| `haruko` - latest `fct_otc_haruko_pnl_portfolio` row per entity (same query shape as `get_desk_risk_snapshot`) | local timer | `20` (A1 Ltd), `86` (ADSD), `combined` (sum) | `delta_usd`, `delta_adjusted_usd`, `gamma_usd`, `gamma_pct_usd`, `vega`, `theta`, `day_pnl`, `ytd_pnl`, `gross_notional`, `equity`, `valid_pricer_pct` (combined = pricer-count weighted), `data_quality_flag` (value 1 = Normal / 0 = flagged; `value_json` carries the flag text and as-of time) |
+| `signals` - `fetch_token_metrics(FULL_TOKEN_UNIVERSE, 45 days)` -> `calculate_statistical_signals` | Cloud Run job | one per token (`btc`, `eth`, ...) | `<m>` (latest value) and `<m>_z` (z-score) for `spot_volume`, `perp_volume`, `perp_oi`, `total_liquidations` and, where listed, `dvol_close`, `atm_iv_30d`, `pcr_oi`, `options_notional_volume`, `options_block_notional_volume`; `skew_25d_30d` / `pcr_volume_24h` plus `_chg7d`; `price`, `price_pct_change_1d`, `funding_rate` (annualised %). Values are as of the last complete UTC day (`value_json.as_of`). |
+| `sheet` - A1 Metrics Dashboard (`monthly_volume_pnl`, `weekly_pnl`) | local timer | `HOLD`, `A1`, `TOTAL` | `mtd_volume_usd`, `mtd_pnl_usd`, `mtd_take_rate_bps` (latest populated month <= current), `ytd_volume_usd`, `ytd_pnl_usd`, `ytd_take_rate_bps`, `ytd_target_pnl_usd` / `ytd_pct_of_target` (TOTAL), `week_pnl_usd` (latest week), `week_realized_pnl_usd` / `week_unrealized_pnl_usd` (A1) |
 
 Chat tools (`tools/snapshot_tools.py`, read-only, registered through `chat.default_tools()`):
 
@@ -566,6 +600,35 @@ Chat tools (`tools/snapshot_tools.py`, read-only, registered through `chat.defau
   the closest earlier one, up to 31 days, and says so).
 - `list_snapshot_metrics(source="")` - captured entities / metrics and the latest snapshot date per source.
 
-Schedule: `deploy/trading-signals-snapshot.service` + `.timer` run it at 23:30 UTC daily (not enabled;
-install like the daily-post timer in `deploy/cloud-run.md`). Haruko's own EOD row lands at ~23:55 UTC, so
-the snapshot holds the latest intraday portfolio row of the day. First live run 2026-09-11.
+### Cloud job: deploy, schedule, inspect
+
+`deploy/deploy_snapshot_job.sh` is idempotent - run it after any code change (Cloud Build takes 3-5 min):
+
+```bash
+deploy/deploy_snapshot_job.sh                 # gcloud run jobs deploy --source . + scheduler create/update
+gcloud run jobs execute trading-signals-snapshot --region us-east1 --project anchorage-corp-eng-playground --wait
+gcloud run jobs executions list --job trading-signals-snapshot --region us-east1 --project anchorage-corp-eng-playground
+gcloud logging read 'resource.type="cloud_run_job" AND resource.labels.job_name="trading-signals-snapshot"' \
+  --project anchorage-corp-eng-playground --freshness 1d --limit 100 --order asc --format 'value(timestamp,textPayload)'
+gcloud scheduler jobs describe trading-signals-snapshot-daily --location us-east1 --project anchorage-corp-eng-playground
+bq --project_id=anchorage-corp-eng-playground query --use_legacy_sql=false \
+  'SELECT source, COUNT(*) n, MAX(captured_at) FROM `anchorage-corp-eng-playground.gmask_bot.snapshots`
+   WHERE snapshot_date = CURRENT_DATE() GROUP BY source'
+```
+
+| | |
+|---|---|
+| Job | `trading-signals-snapshot`, `us-east1`, 1 task, 1 vCPU / 1 GiB, 20 min timeout, 1 retry; image built from the repo `Dockerfile` by Cloud Build (`--source .`), command `python snapshot_daily.py --sources signals --verbose` |
+| Env | `SNAPSHOT_BACKEND=bigquery`, `SNAPSHOT_BQ_TABLE`, `GCP_SECRETS_PROJECT=anchorage-trading-solutions`, `BQ_BILLING_PROJECT=anchorage-corp-eng-playground`, `VERTEX_PROJECT=anchorage-ai-development`, `MEMORY_EMBEDDINGS=off`, `FORCE_IPV4=0` |
+| Scheduler | `trading-signals-snapshot-daily`: cron `30 23 * * *` (Etc/UTC), `POST https://run.googleapis.com/v2/projects/anchorage-corp-eng-playground/locations/us-east1/jobs/trading-signals-snapshot:run`, OAuth token of the job's service account (the Admin API is a Google API, so OAuth rather than an OIDC identity token), 30 min attempt deadline |
+| Service account | `gm-bot@anchorage-corp-eng-playground.iam.gserviceaccount.com`: `secretmanager.secretAccessor` on `amberdata_key` + `coinmetrics_trial_api` (anchorage-trading-solutions), `bigquery.jobUser` on the project, `bigquery.dataEditor` on dataset `gmask_bot`, `aiplatform.user` on anchorage-ai-development, `run.invoker` on the project (lets the scheduler call `jobs.run`). It has **no** access to `anc-global-markets` or the Google Sheet. |
+| First cloud run | 2026-09-11 17:43 UTC (`trading-signals-snapshot-lpcc6`): 28 tokens, 370 rows in 84.8 s, exit 0 |
+
+Costs are negligible: one ~90 s run per day of a 1 vCPU container (well inside the Cloud Run free tier),
+Cloud Scheduler's first three jobs are free, and every BigQuery query touches a few MB of a table that
+grows by ~400 rows a day (the 10 MB minimum per query applies; a month of bot usage is cents).
+
+Local timer: `deploy/trading-signals-snapshot.service` + `.timer` (installed in
+`~/.config/systemd/user/`, 23:30 UTC) run `--sources haruko,sheet` and read `.env`, so they write to the
+same BigQuery table. Haruko's own EOD row lands at ~23:55 UTC, so the snapshot holds the latest intraday
+portfolio row of the day. First live run 2026-09-11 (all three sources locally, then migrated).

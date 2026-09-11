@@ -1,8 +1,15 @@
 #!/usr/bin/env python
 """Capture a daily snapshot of desk risk, market signals and spot PnL into the
-`snapshots` table of providers.memory_store (env MEMORY_DB_URL, default
-sqlite:///data/memory.db), so the chat agent can answer "how has X moved since ..."
-questions via tools/snapshot_tools.py.
+`snapshots` table of providers.memory_store, so the chat agent can answer "how has X
+moved since ..." questions via tools/snapshot_tools.py.
+
+Where the rows go is the store's SNAPSHOT_BACKEND (.env): `sqlite` = the memory database
+(MEMORY_DB_URL, default sqlite:///data/memory.db); `bigquery` = the shared table
+SNAPSHOT_BQ_TABLE. In production the `signals` source runs as a Cloud Run job
+(deploy/deploy_snapshot_job.sh, 23:30 UTC) writing to BigQuery, and the local systemd
+timer runs `--sources haruko,sheet` (those need the user's own credentials).
+Only the stdlib is imported at module level; each source imports what it needs when it
+runs, so a machine without Sheets/desk-BigQuery access can still run `--sources signals`.
 
 Sources (each isolated: one failing never stops the others):
 
@@ -407,6 +414,12 @@ def _get_store():
 
 
 def write_rows(store, snapshot_date: date, source: str, rows: Sequence[Row]) -> int:
+    """Upsert a source's rows. One bulk ``put_snapshots`` call when the store offers it (the
+    BigQuery backend turns that into a single MERGE per batch); per-row otherwise."""
+    if hasattr(store, "put_snapshots"):
+        return int(store.put_snapshots([
+            {"snapshot_date": snapshot_date, "source": source, "entity": r.entity, "metric": r.metric,
+             "value": r.value, "value_json": r.value_json} for r in rows]))
     n = 0
     for r in rows:
         store.put_snapshot(snapshot_date, source, r.entity, r.metric, r.value, value_json=r.value_json)
@@ -472,6 +485,9 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def main(argv=None) -> int:
+    from dotenv import load_dotenv
+
+    load_dotenv()  # SNAPSHOT_BACKEND etc. from .env, like every other entry point
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")

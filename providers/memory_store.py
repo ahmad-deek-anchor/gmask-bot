@@ -19,6 +19,11 @@ Backends: ``sqlite:///path`` (default, fully supported) or ``postgresql://...`` 
 the same SQL through psycopg - needs ``pip install psycopg[binary]``, otherwise a clear
 NotImplementedError is raised).
 
+Snapshots have their own backend switch, env ``SNAPSHOT_BACKEND``: ``sqlite`` (default; the
+``snapshots`` table above) or ``bigquery`` (providers/snapshot_bq.py: the shared table
+``SNAPSHOT_BQ_TABLE`` that the Cloud Run job writes and the local bot reads). Memories
+always stay in the local database. All snapshot methods return identical shapes on both.
+
 Thread-safe: every statement runs under one lock on a single connection (the agent runs tool
 calls in threads and the Slack bot summarises sessions in background tasks).
 """
@@ -46,6 +51,8 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 DEFAULT_DB_URL = "sqlite:///data/memory.db"
+DEFAULT_SNAPSHOT_BACKEND = "sqlite"
+SNAPSHOT_BACKENDS = ("sqlite", "bigquery")
 DEFAULT_EMBED_MODEL = "text-embedding-005"
 DEFAULT_EMBED_PROJECT = "anchorage-ai-development"
 DEFAULT_EMBED_LOCATION = "us-central1"
@@ -445,13 +452,16 @@ class MemoryStore:
     ``"auto"`` (default) picks :func:`default_embedder`; ``None`` disables embeddings (keyword search).
     """
 
-    def __init__(self, url: str | None = None, embedder: Any = "auto"):
+    def __init__(self, url: str | None = None, embedder: Any = "auto", snapshot_backend: Any = None):
         self.url = url or os.getenv("MEMORY_DB_URL") or DEFAULT_DB_URL
         self._db = _open_backend(self.url)
         self._embedder = default_embedder() if embedder == "auto" else embedder
         self._search_lock = threading.Lock()
+        self._snapshots = _open_snapshot_backend(snapshot_backend, self._db, self.url)
         logger.info("Memory store: %s (embeddings: %s)", self.url,
                     "keyword only" if self._embedder is None else type(self._embedder).__name__)
+        logger.info("Snapshot backend: %s (%s)", self.snapshot_backend_name,
+                    getattr(self._snapshots, "label", "") or type(self._snapshots).__name__)
 
     # -- embeddings ------------------------------------------------------
 
@@ -606,24 +616,110 @@ class MemoryStore:
         keep = [m for m in scored if m.score >= min_score][:k]
         return rules + keep
 
-    # -- snapshots -------------------------------------------------------
+    # -- snapshots (delegated to the selected backend; see SqliteSnapshotBackend) ---------
+
+    @property
+    def snapshot_backend(self):
+        """The object that owns the snapshots table (SqliteSnapshotBackend or
+        providers.snapshot_bq.BigQuerySnapshotBackend)."""
+        return self._snapshots
+
+    @property
+    def snapshot_backend_name(self) -> str:
+        return getattr(self._snapshots, "name", type(self._snapshots).__name__)
 
     def put_snapshot(self, snapshot_date, source: str, entity: str, metric: str, value,
                      value_json=None, captured_at: datetime | None = None) -> None:
         """Upsert one (date, source, entity, metric) cell. ``value`` float-able or None;
         ``value_json`` a JSON string or any JSON-serialisable object (dict/list) or None."""
+        return self._snapshots.put_snapshot(snapshot_date, source, entity, metric, value,
+                                            value_json=value_json, captured_at=captured_at)
+
+    def put_snapshots(self, rows: Iterable[dict]) -> int:
+        """Bulk upsert; each row: {snapshot_date, source, entity, metric, value, value_json?,
+        captured_at?}. Returns the number of rows given."""
+        return self._snapshots.put_snapshots(rows)
+
+    def get_snapshot(self, snapshot_date, source: str, entity: str, metric: str) -> Optional[dict]:
+        """One cell as {snapshot_date: date, value, value_json (parsed), captured_at} or None."""
+        return self._snapshots.get_snapshot(snapshot_date, source, entity, metric)
+
+    def get_snapshot_series(self, source: str, entity: str, metric: str, days: int | None = 30,
+                            end: date | None = None) -> list[dict]:
+        """Daily points ascending: [{snapshot_date: date, value: float|None, value_json: obj|None,
+        captured_at: str}]. ``days`` counts back from ``end`` (default today UTC); None = all."""
+        return self._snapshots.get_snapshot_series(source, entity, metric, days=days, end=end)
+
+    def latest_snapshot_date(self, source: str, entity: str | None = None, metric: str | None = None) -> Optional[date]:
+        return self._snapshots.latest_snapshot_date(source, entity=entity, metric=metric)
+
+    def list_snapshot_metrics(self, source: str, entity: str | None = None) -> list[dict]:
+        """[{entity, metric, first_date, last_date, n}] sorted by entity, metric."""
+        return self._snapshots.list_snapshot_metrics(source, entity=entity)
+
+    def list_snapshot_entities(self, source: str) -> list[str]:
+        return self._snapshots.list_snapshot_entities(source)
+
+    def list_snapshot_sources(self) -> list[str]:
+        return self._snapshots.list_snapshot_sources()
+
+    def count_snapshots(self, source: str | None = None, snapshot_date=None) -> int:
+        return self._snapshots.count_snapshots(source=source, snapshot_date=snapshot_date)
+
+    # -- lifecycle -------------------------------------------------------
+
+    def close(self) -> None:
+        try:
+            self._snapshots.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._db.close()
+
+
+# ---------------------------------------------------------------------------
+# Snapshot backends
+# ---------------------------------------------------------------------------
+
+def normalise_snapshot_value(value) -> Optional[float]:
+    """float or None (None / NaN / inf / non-numeric all become None)."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(v) or math.isinf(v) else v
+
+
+def normalise_snapshot_json(value_json) -> Optional[str]:
+    """JSON text or None; non-string objects are serialised."""
+    if value_json is None:
+        return None
+    return value_json if isinstance(value_json, str) else json.dumps(value_json, default=str)
+
+
+def snapshot_row_dict(r: tuple) -> dict:
+    """The row shape every backend returns for one snapshot cell."""
+    return {"snapshot_date": _to_date(r[0]), "value": None if r[1] is None else float(r[1]),
+            "value_json": _loads(r[2]) if r[2] else None, "captured_at": str(r[3]) if r[3] else None}
+
+
+class SqliteSnapshotBackend:
+    """Snapshots table inside the memory database (the original, default behaviour)."""
+
+    name = "sqlite"
+
+    def __init__(self, db: _Backend, label: str = ""):
+        self._db = db
+        self.label = label
+
+    def put_snapshot(self, snapshot_date, source: str, entity: str, metric: str, value,
+                     value_json=None, captured_at: datetime | None = None) -> None:
         d = _to_date(snapshot_date).isoformat()
-        v = None
-        if value is not None:
-            try:
-                v = float(value)
-                if math.isnan(v) or math.isinf(v):
-                    v = None
-            except (TypeError, ValueError):
-                v = None
-        vj = None
-        if value_json is not None:
-            vj = value_json if isinstance(value_json, str) else json.dumps(value_json, default=str)
+        v = normalise_snapshot_value(value)
+        vj = normalise_snapshot_json(value_json)
+        if captured_at is not None and captured_at.tzinfo is not None:   # store naive UTC text
+            captured_at = captured_at.astimezone(timezone.utc).replace(tzinfo=None)
         cap = _iso(captured_at or _utcnow())
         self._db.execute(
             "INSERT INTO snapshots (snapshot_date, source, entity, metric, value, value_json, captured_at) "
@@ -633,27 +729,23 @@ class MemoryStore:
             (d, source, str(entity), metric, v, vj, cap))
 
     def put_snapshots(self, rows: Iterable[dict]) -> int:
-        """Bulk upsert; each row: {snapshot_date, source, entity, metric, value, value_json?}. Returns count."""
         n = 0
         for r in rows:
             self.put_snapshot(r["snapshot_date"], r["source"], r["entity"], r["metric"], r.get("value"),
-                              r.get("value_json"))
+                              r.get("value_json"), captured_at=r.get("captured_at"))
             n += 1
         return n
 
     def get_snapshot(self, snapshot_date, source: str, entity: str, metric: str) -> Optional[dict]:
-        """One cell as {snapshot_date: date, value, value_json (parsed), captured_at} or None."""
         d = _to_date(snapshot_date).isoformat()
         rows = self._db.fetchall(
             "SELECT snapshot_date, value, value_json, captured_at FROM snapshots "
             "WHERE snapshot_date = ? AND source = ? AND entity = ? AND metric = ?",
             (d, source, str(entity), metric))
-        return self._snap_row(rows[0]) if rows else None
+        return snapshot_row_dict(rows[0]) if rows else None
 
     def get_snapshot_series(self, source: str, entity: str, metric: str, days: int | None = 30,
                             end: date | None = None) -> list[dict]:
-        """Daily points ascending: [{snapshot_date: date, value: float|None, value_json: obj|None,
-        captured_at: str}]. ``days`` counts back from ``end`` (default today UTC); None = all."""
         params: list = [source, str(entity), metric]
         sql = ("SELECT snapshot_date, value, value_json, captured_at FROM snapshots "
                "WHERE source = ? AND entity = ? AND metric = ?")
@@ -663,7 +755,7 @@ class MemoryStore:
             sql += " AND snapshot_date >= ? AND snapshot_date <= ?"
             params += [start.isoformat(), end_d.isoformat()]
         sql += " ORDER BY snapshot_date ASC"
-        return [self._snap_row(r) for r in self._db.fetchall(sql, params)]
+        return [snapshot_row_dict(r) for r in self._db.fetchall(sql, params)]
 
     def latest_snapshot_date(self, source: str, entity: str | None = None, metric: str | None = None) -> Optional[date]:
         sql = "SELECT MAX(snapshot_date) FROM snapshots WHERE source = ?"
@@ -678,7 +770,6 @@ class MemoryStore:
         return _to_date(rows[0][0]) if rows and rows[0][0] else None
 
     def list_snapshot_metrics(self, source: str, entity: str | None = None) -> list[dict]:
-        """[{entity, metric, first_date, last_date, n}] sorted by entity, metric."""
         sql = ("SELECT entity, metric, MIN(snapshot_date), MAX(snapshot_date), COUNT(*) FROM snapshots "
                "WHERE source = ?")
         params: list = [source]
@@ -706,15 +797,31 @@ class MemoryStore:
             params.append(_to_date(snapshot_date).isoformat())
         return int(self._db.fetchall(sql, params)[0][0])
 
-    @staticmethod
-    def _snap_row(r: tuple) -> dict:
-        return {"snapshot_date": _to_date(r[0]), "value": None if r[1] is None else float(r[1]),
-                "value_json": _loads(r[2]) if r[2] else None, "captured_at": str(r[3]) if r[3] else None}
+    def close(self) -> None:  # the connection belongs to the MemoryStore
+        return None
 
-    # -- lifecycle -------------------------------------------------------
 
-    def close(self) -> None:
-        self._db.close()
+def snapshot_backend_from_env() -> str:
+    raw = (os.getenv("SNAPSHOT_BACKEND") or DEFAULT_SNAPSHOT_BACKEND).strip().lower()
+    if raw not in SNAPSHOT_BACKENDS:
+        raise ValueError(f"Unsupported SNAPSHOT_BACKEND={raw!r}; choose from {', '.join(SNAPSHOT_BACKENDS)}")
+    return raw
+
+
+def _open_snapshot_backend(spec, db: _Backend, url: str):
+    """``spec``: None (env SNAPSHOT_BACKEND), 'sqlite' | 'bigquery', or a ready backend object."""
+    if spec is None:
+        spec = snapshot_backend_from_env()
+    if isinstance(spec, str):
+        kind = spec.strip().lower()
+        if kind == "sqlite":
+            return SqliteSnapshotBackend(db, label=url)
+        if kind == "bigquery":
+            from providers.snapshot_bq import BigQuerySnapshotBackend
+
+            return BigQuerySnapshotBackend()
+        raise ValueError(f"Unsupported snapshot backend {spec!r}; choose from {', '.join(SNAPSHOT_BACKENDS)}")
+    return spec
 
 
 def _loads(s) -> Any:
@@ -732,4 +839,6 @@ __all__ = [
     "Memory", "MemoryStore", "HashEmbedder", "VertexEmbedder", "default_embedder", "keyword_scores", "cosine",
     "SHARED_FACTS", "prefs_namespace", "rules_namespace", "episodes_namespace", "episode_ttl_days",
     "DEFAULT_DB_URL", "DEFAULT_EPISODE_TTL_DAYS",
+    "SqliteSnapshotBackend", "snapshot_backend_from_env", "snapshot_row_dict",
+    "normalise_snapshot_value", "normalise_snapshot_json", "DEFAULT_SNAPSHOT_BACKEND", "SNAPSHOT_BACKENDS",
 ]

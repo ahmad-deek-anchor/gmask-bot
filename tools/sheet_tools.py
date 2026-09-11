@@ -3,8 +3,9 @@
 Scope: the **spot** business's booked PnL as the desk maintains it by hand
 (owner Joao Luis, updated daily): HOLD (client spot trading - commissions on client
 trades) vs A1 (A1 Ltd, the principal spot desk) monthly volume / PnL / take rate,
-weekly realised / unrealised PnL, HOLD financing fees, and the counterparty trade
-blotter. This is a different source from the Haruko mark-to-market PnL of the OTC /
+weekly realised / unrealised PnL, HOLD financing fees, the counterparty trade
+blotter, and A1's daily realised PnL split into client flow vs non-client (proprietary)
+flow ('A1 database' tab, columns R:X). This is a different source from the Haruko mark-to-market PnL of the OTC /
 derivatives book in BigQuery (tools/desk_tools.py); the tools say so in every answer.
 
 Every tool returns compact markdown, formats USD with ``$`` and thousands separators,
@@ -15,13 +16,14 @@ line ("A1 Metrics Dashboard sheet maintained by the desk"). Nothing here writes.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import timedelta
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 from langchain_core.tools import tool
 
-from providers.gsheets import SheetsAccessError, SheetsUnavailable, clamp_a1_range, parse_a1_range
+from providers.gsheets import SheetsAccessError, SheetsUnavailable, clamp_a1_range, parse_a1_range, parse_sheet_date
 from tools.desk_tools import _isna, _md_table, _num, _usd
 
 logger = logging.getLogger(__name__)
@@ -32,7 +34,10 @@ MAX_RANGE_COLS = 30
 MAX_TOP_N = 50
 MAX_WEEKS = 60
 MAX_MONTHS = 24
+MAX_DAILY_ROWS = 45          # per-day table above this many rows collapses to monthly subtotals
 BY_CHOICES = ("counterparty", "symbol", "side")
+WINDOW_SHORTCUTS = ("last week", "this week", "mtd", "ytd", "last month", "this month", "last N days", "yesterday",
+                    "YYYY-MM-DD [YYYY-MM-DD]")
 
 UNAVAILABLE = (
     "Spot desk PnL (A1 Metrics Dashboard sheet) is not available: Application Default "
@@ -411,6 +416,243 @@ def get_nonclient_pnl(months: int = 6) -> str:
     return _guarded("get_nonclient_pnl", body)
 
 
+# ---------------------------------------------------------------------------
+# client flow vs non-client flow (A1 database tab)
+# ---------------------------------------------------------------------------
+
+_LAST_N_DAYS_RE = re.compile(r"^(?:last|past|previous|trailing)\s+(\d{1,3})\s*(?:d|day|days)$")
+_N_DAYS_RE = re.compile(r"^(\d{1,3})\s*(?:d|day|days)$")
+
+
+def _week_bounds(anchor: pd.Timestamp, weeks: Optional[pd.DataFrame], offset: int = 0) -> Tuple[pd.Timestamp, pd.Timestamp, Optional[int]]:
+    """(start, end, week_no) of the dashboard week containing `anchor`, shifted by `offset`
+    weeks (-1 = last week). Uses the 'Weekly PNL' start / end dates when available, else
+    the desk's Friday-Thursday convention."""
+    if weeks is not None and len(weeks):
+        wk = weeks[(~weeks["is_total"]) & weeks["start_date"].notna() & weeks["end_date"].notna()].sort_values("start_date")
+        hit = wk[(wk["start_date"] <= anchor) & (wk["end_date"] >= anchor)]
+        if len(hit):
+            pos = wk.index.get_loc(hit.index[0]) + offset
+            if 0 <= pos < len(wk):
+                w = wk.iloc[pos]
+                return w["start_date"].normalize(), w["end_date"].normalize(), int(w["week"])
+    # Fri-Thu fallback
+    start = anchor.normalize() - timedelta(days=(anchor.weekday() - 4) % 7) + timedelta(days=7 * offset)
+    return start, start + timedelta(days=6), None
+
+
+def resolve_client_flow_window(start_date: Optional[str], end_date: Optional[str], anchor: pd.Timestamp,
+                               weeks: Optional[pd.DataFrame] = None) -> Tuple[pd.Timestamp, pd.Timestamp, str]:
+    """Turn the tool's date arguments into (start, end, label).
+
+    `anchor` is the sheet's data-as-of date (never the wall clock). Shortcuts (case-
+    insensitive, in start_date): 'last week' / 'this week' (dashboard weeks), 'mtd' /
+    'month to date', 'ytd' / 'year to date', 'last month', 'this month', 'last N days'
+    (N days ending on the anchor), 'yesterday', 'today'. Otherwise start_date / end_date
+    are dates (ISO or anything the sheet parsers accept); a missing end_date means the
+    anchor for open-ended words and the start itself for a single date.
+    """
+    key = re.sub(r"\s+", " ", (start_date or "").strip().lower())
+    a = anchor.normalize()
+    if key in ("last week", "previous week", "prior week"):
+        s_, e_, wno = _week_bounds(a, weeks, -1)
+        return s_, e_, f"last week{f' = dashboard week {wno}' if wno else ''}"
+    if key in ("this week", "current week", "week to date", "wtd"):
+        s_, e_, wno = _week_bounds(a, weeks, 0)
+        return s_, e_, f"this week{f' = dashboard week {wno}' if wno else ''} (in progress)"
+    if key in ("mtd", "month to date", "month-to-date", "this month", "current month"):
+        return a.replace(day=1), a, "month to date"
+    if key in ("ytd", "year to date", "year-to-date", "this year"):
+        return a.replace(month=1, day=1), a, "year to date"
+    if key in ("last month", "previous month", "prior month"):
+        first_this = a.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        return last_prev.replace(day=1), last_prev, "last month"
+    if key in ("yesterday",):
+        d = a - timedelta(days=1)
+        return d, d, "yesterday"
+    if key in ("today", "latest"):
+        return a, a, "latest day"
+    m = _LAST_N_DAYS_RE.match(key) or _N_DAYS_RE.match(key)
+    if m:
+        n = max(1, min(int(m.group(1)), 400))
+        return a - timedelta(days=n - 1), a, f"last {n} days"
+    s_ts = parse_sheet_date(start_date) if start_date else None
+    if s_ts is None:
+        raise ValueError(f"Could not understand start_date={start_date!r}. Use an ISO date (YYYY-MM-DD) or one of: "
+                         + ", ".join(WINDOW_SHORTCUTS) + ".")
+    s_ts = s_ts.normalize()
+    if end_date:
+        e_key = re.sub(r"\s+", " ", str(end_date).strip().lower())
+        e_ts = a if e_key in ("today", "now", "latest", "asof", "as of") else parse_sheet_date(end_date)
+        if e_ts is None:
+            raise ValueError(f"Could not understand end_date={end_date!r}; use an ISO date (YYYY-MM-DD).")
+        e_ts = e_ts.normalize()
+    else:
+        e_ts = s_ts
+    if e_ts < s_ts:
+        s_ts, e_ts = e_ts, s_ts
+    label = s_ts.strftime("%Y-%m-%d") if s_ts == e_ts else f"{s_ts.strftime('%Y-%m-%d')} to {e_ts.strftime('%Y-%m-%d')}"
+    return s_ts, e_ts, label
+
+
+def _share(v: Optional[float]) -> str:
+    return "n/a" if v is None or _isna(v) else f"{v * 100:.1f}%"
+
+
+def _client_flow_markdown(sheet, res: Dict, label: str, include_daily: bool) -> str:
+    tab = res["tab"]
+    sums = res["sums"]
+    rows: pd.DataFrame = res["rows"]
+    out = ["**A1 spot realised PnL - client flow vs non-client (proprietary) flow**"]
+    coverage = f"{res['n_rows']} populated day-row(s)"
+    if rows is not None and len(rows):
+        coverage += f", sheet rows {int(rows['row_number'].min())}-{int(rows['row_number'].max())}"
+    span = f"{res['start']} to {res['end']}" if res["start"] != res["end"] else res["start"]
+    out.append(f"Window: {span}" + (f" ({label})" if label and label != span else "") + f" - {coverage}.")
+    as_of = res.get("data_as_of")
+    out.append(f"Data as of: **{as_of or 'n/a'}** (dashboard date; last populated row in '{tab}' is {res.get('last_row_date') or 'n/a'})")
+    out.append(f"Source: {SOURCE_NAME}, tab '{tab}' columns R:X (R date, V daily realised total, W client flow, "
+               "X non-client flow) - booked spot PnL of A1 Ltd, not the Haruko derivatives book (BigQuery).")
+
+    if not res["n_rows"]:
+        out.append("")
+        out.append("No populated rows in that window" + (f"; the tab covers {res.get('first_row_date')} to {res.get('last_row_date')}."
+                                                          if res.get("first_row_date") else "."))
+        if res["not_populated"]:
+            out.append(f"Days after the last populated row: {res['not_populated'][0]} to {res['not_populated'][-1]}.")
+        if res["artifact_rows"]:
+            out.append("Excluded artefact rows: " + "; ".join(
+                f"row {a['row_number']} {a['date']} V {_usd(a['realized_total'])}" for a in res["artifact_rows"]))
+        return "\n".join(out)
+
+    tot = sums["realized_total"]
+    out.append("")
+    out.append(f"**Totals:** realised {_usd(tot)} = client flow {_usd(sums['realized_client'])} ({_share(res['client_share'])})"
+               f" + non-client flow {_usd(sums['realized_nonclient'])} ({_share(res['nonclient_share'])})"
+               + (f" over {res['n_days']} day(s)" if res["n_days"] else ""))
+    if res["client_share"] is not None and (res["client_share"] < 0 or res["nonclient_share"] < 0):
+        out.append("(one leg is negative, so the percentage shares are of the net total and exceed 100% / go negative.)")
+    resid = tot - sums["realized_client"] - sums["realized_nonclient"]
+    if abs(resid) > 1.0:
+        out.append(f"Note: V does not equal W + X over this window (difference {_usd(resid)}) - "
+                   + (f"{len(res['incomplete_rows'])} row(s) lack the W/X split: "
+                      + ", ".join(f"row {r['row_number']} ({r['date']})" for r in res["incomplete_rows"])
+                      if res["incomplete_rows"] else "sheet rows carry an inconsistency") + ".")
+    elif res["incomplete_rows"]:
+        out.append("Rows lacking the W/X split: " + ", ".join(f"row {r['row_number']} ({r['date']})" for r in res["incomplete_rows"]) + ".")
+
+    if include_daily:
+        out.append("")
+        if len(rows) <= MAX_DAILY_ROWS:
+            table = []
+            for _, r in rows.iterrows():
+                flag = " *" if r["flagged_artifact"] else ""
+                table.append([r["date"].strftime("%Y-%m-%d") + flag, str(int(r["row_number"])), _usd(r["realized_total"]),
+                              _usd(r["realized_client"]), _usd(r["realized_nonclient"])])
+            out += _md_table(["Date", "Row", "Realised total (V)", "Client flow (W)", "Non-client (X)"], table)
+            if rows["flagged_artifact"].any():
+                out.append("\\* offsetting artefact pair - see below.")
+        else:
+            g = rows.groupby(rows["date"].dt.to_period("M"))
+            table = [[str(p), str(int(sub["date"].nunique())), _usd(sub["realized_total"].sum()), _usd(sub["realized_client"].sum()),
+                      _usd(sub["realized_nonclient"].sum())] for p, sub in g]
+            out += _md_table(["Month", "Days", "Realised total (V)", "Client flow (W)", "Non-client (X)"], table)
+            out.append(f"({len(rows)} day-rows collapsed to monthly subtotals; ask for a shorter window for the per-day table.)")
+
+    notes = []
+    if res["missing_days"]:
+        md = res["missing_days"]
+        shown = ", ".join(md[:12]) + (f" ... ({len(md)} in total)" if len(md) > 12 else "")
+        notes.append(f"Missing days (no row in the sheet for these dates in the window; the tab normally has weekends too): {shown}.")
+    if res["not_populated"]:
+        np_ = res["not_populated"]
+        notes.append(f"Not yet populated: {np_[0]}" + (f" to {np_[-1]}" if len(np_) > 1 else "") + " (after the last row).")
+    if res["duplicate_dates"]:
+        notes.append(f"Two snapshot rows on {', '.join(res['duplicate_dates'])} - both summed (intraday increments).")
+    for a in res["artifact_rows"]:
+        notes.append(f"Artefact row {a['row_number']} ({a['date']}): V {_usd(a['realized_total'])}, W {_usd(a['realized_client'])}, "
+                     f"X {_usd(a['realized_nonclient'])} - {a['action']}.")
+    if res["artifact_rows"] and any(a["action"].startswith("kept") for a in res["artifact_rows"]):
+        notes.append(f"The kept pair(s) net to {_usd(res['artifact_net'])} (the desk's weekly totals carry them the same way); "
+                     "the per-day figures on those dates are not meaningful.")
+    if res["excluded"] is not None and len(res["excluded"]):
+        ex = res["sums_all_rows"]
+        notes.append(f"Including the excluded leg(s) the raw sums would be V {_usd(ex['realized_total'])}, "
+                     f"W {_usd(ex['realized_client'])}, X {_usd(ex['realized_nonclient'])}.")
+    wc = res.get("weekly_check")
+    if wc:
+        if wc["a1_realized"] is None:
+            notes.append(f"Weekly cross-check: 'Weekly PNL' week {wc['week']} has no A1 Realized figure yet.")
+        else:
+            diff = wc["difference"]
+            verdict = "matches" if abs(diff) < 1.0 else ("within rounding" if abs(diff) < 5 else "DIFFERS")
+            notes.append(f"Weekly cross-check: 'Weekly PNL' tab week {wc['week']} ({wc['start_date']} to {wc['end_date']}) "
+                         f"A1 Realized PNL {_usd(wc['a1_realized'])} - {verdict} (difference {_usd(diff)})"
+                         + (f"; that tab's unrealised approximation for the week is {_usd(wc['a1_unrealized'])}, not included here"
+                            if wc.get("a1_unrealized") is not None else "") + ".")
+    yc = res.get("ytd_check")
+    if yc:
+        notes.append(f"YTD cross-check: the sheet's own cumulative YTD columns (S/T/U) at {yc['date']} read total "
+                     f"{_usd(yc['cum_total'])}, client {_usd(yc['cum_client'])}, non-client {_usd(yc['cum_nonclient'])} - "
+                     f"differences vs the summed daily rows: {_usd(yc['diff_total'])} / {_usd(yc['diff_client'])} / "
+                     f"{_usd(yc['diff_nonclient'])}"
+                     + (" (small: timing / missing rows in a hand-maintained sheet)" if max(abs(yc['diff_total']), abs(yc['diff_client']), abs(yc['diff_nonclient'])) < 0.05 * max(1.0, abs(yc['cum_total'])) else " (LARGE - flag to the desk)") + ".")
+    if notes:
+        out.append("")
+        out += notes
+    out.append("")
+    out.append("Caveats: realised PnL only - the unrealised (open inventory) approximation is excluded; A1 Ltd spot only - "
+               "HOLD (client commissions) is not included; the split is the desk's own client-flow / non-client-flow "
+               "attribution in a hand-maintained sheet - quote the as-of date and do not extrapolate beyond the last populated row.")
+    return "\n".join(out)
+
+
+@tool
+def get_a1_client_flow_split(start_date: str, end_date: Optional[str] = None, include_daily: bool = True) -> str:
+    """A1 spot desk REALISED PnL split between client flow and non-client (proprietary /
+    prop / house) flow for a date window, from the A1 Metrics Dashboard sheet ('A1
+    database' tab, columns R:X: per-day realised total V = client flow W + non-client
+    flow X). USE THIS for any question about client vs non-client / proprietary / prop
+    flow, flow attribution, or "how much of A1's PnL came from clients" - never read
+    raw cells for that. `start_date`: ISO date or a shortcut - "last week", "this week"
+    (dashboard Fri-Thu weeks), "mtd", "ytd", "last month", "last N days", "yesterday" -
+    resolved against the sheet's data-as-of date. `end_date`: ISO date (defaults to the
+    start date for a single day; ignored for shortcuts). Returns the per-day table (or
+    monthly subtotals for long windows; include_daily=False to skip), totals with % split,
+    missing days, offsetting artefact rows (disclosed / excluded), a cross-check against
+    the 'Weekly PNL' tab when the window is a dashboard week, and caveats (realised
+    only, unrealised excluded; A1 only, HOLD not included).
+    """
+    def body(sheet) -> str:
+        as_of = None
+        try:
+            as_of = sheet.dashboard_as_of()
+        except (SheetsAccessError, SheetsUnavailable):
+            raise
+        except Exception:  # noqa: BLE001
+            as_of = None
+        weeks = None
+        try:
+            weeks = sheet.weekly_pnl(include_future=True)
+        except (SheetsAccessError, SheetsUnavailable):
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.debug("weekly tab unavailable for window resolution: %s", e)
+        anchor = pd.Timestamp(as_of) if as_of else None
+        if anchor is None:
+            probe = sheet.client_flow_daily()
+            last = probe.attrs.get("last_row_date")
+            anchor = pd.Timestamp(last) if last else pd.Timestamp.today().normalize()
+        try:
+            s_ts, e_ts, label = resolve_client_flow_window(start_date, end_date, anchor, weeks)
+        except ValueError as e:
+            return str(e)
+        res = sheet.client_flow_window(s_ts, e_ts, exclude_artifacts=True)
+        return _client_flow_markdown(sheet, res, label, bool(include_daily))
+    return _guarded("get_a1_client_flow_split", body)
+
+
 @tool
 def list_a1_dashboard_tabs() -> str:
     """List the tabs of the A1 Metrics Dashboard sheet (name, size) and which tools read
@@ -425,6 +667,7 @@ def list_a1_dashboard_tabs() -> str:
             sheet.tabs["financing_fees"]: "get_financing_fees",
             sheet.tabs["nonclient_pnl"]: "get_nonclient_pnl",
             sheet.tabs["trades"]: "get_counterparty_pnl (trade blotter)",
+            sheet.tabs.get("a1_database", "A1 database"): "get_a1_client_flow_split (cols R:X)",
         }
         out = [f"**{sheet.title or 'A1 Metrics Dashboard'}** - {len(tabs)} tab(s)"]
         out += _source_lines(sheet, sheet.tabs["volume_pnl"], sheet.dashboard_as_of())
@@ -500,6 +743,7 @@ def get_sheet_tools() -> list:
         get_counterparty_pnl,
         get_financing_fees,
         get_nonclient_pnl,
+        get_a1_client_flow_split,
         list_a1_dashboard_tabs,
         read_a1_dashboard_range,
     ]
@@ -511,6 +755,7 @@ __all__ = [
     "SHEET_TOOL_NAMES",
     "SOURCE_NAME",
     "UNAVAILABLE",
+    "get_a1_client_flow_split",
     "get_counterparty_pnl",
     "get_financing_fees",
     "get_nonclient_pnl",
@@ -519,4 +764,5 @@ __all__ = [
     "get_weekly_spot_pnl",
     "list_a1_dashboard_tabs",
     "read_a1_dashboard_range",
+    "resolve_client_flow_window",
 ]

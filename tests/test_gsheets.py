@@ -104,6 +104,37 @@ TRADES = [
     ["not a date", "Broken Row", "BUY", "BTC/USD", 1, "BTC", 1, "USD", 1, 1, "USD", 1, 1],
 ]
 
+# 'A1 database'!R:X as the API returns it (the FakeSession serves this for any range on
+# the tab): R1:S9 asset list + T:X headers, undated history rows (one artefact pair among
+# them), then dated rows with one Google serial date, one missing day (2026-09-04), two
+# snapshots on 2026-09-01, an offsetting pair on 08-30/08-31, a row without the W/X
+# split (09-02), and trailing undated cumulative / total rows.
+A1_DATABASE = [
+    ["FIAT/STABLES", 5_348_119.1, "Client Flow PNL", "Non Client Flow PNL", "Change in Total PNL",
+     "Change in Client Flow PNL", "Change in non Client Flow PNL"],
+    ["BTC", 2_263_820, 4_035_722.69, 859_520.08],
+    ["", "", 5_355_690.55, 1_179_441.43, 10_005_588.66, 10_001_359.63, 4_229.03],
+    ["", "", 5_387_868.1, 1_178_685.72, -9_969_937.79, -9_969_182.08, -755.71],
+    [],
+    ["2026-08-27 22:10:24", 3_000_000.0, 1_800_000.0, 1_200_000.0, 10_000.0, 6_000.0, 4_000.0],
+    [46262, 3_020_000.0, 1_815_000.0, 1_205_000.0, 20_000.0, 15_000.0, 5_000.0],           # serial = 2026-08-28
+    ["2026-08-29 22:10:24", 3_025_000.0, 1_819_000.0, 1_206_000.0, 5_000.0, 4_000.0, 1_000.0],
+    ["2026-08-30 22:10:24", 11_025_000.0, 9_818_000.0, 1_207_000.0, 8_000_000.0, 7_999_000.0, 1_000.0],
+    ["2026-08-31 22:11:39", 3_035_000.0, 1_827_000.0, 1_208_000.0, -7_990_000.0, -7_991_000.0, 1_000.0],
+    ["2026-09-01 8:01:34", 3_038_000.0, 1_830_000.0, 1_208_000.0, 3_000.0, 3_000.0, 0],
+    ["2026-09-01 22:10:24", 3_037_000.0, 1_828_000.0, 1_209_000.0, -1_000.0, -2_000.0, 1_000.0],
+    ["2026-09-02 22:10:25", 3_097_000.0, 1_868_000.0, 1_229_000.0, 60_000.0],
+    ["2026-09-03 22:10:23", 3_797_000.0, 2_578_000.0, 1_219_000.0, 700_000.0, 710_000.0, -10_000.0],
+    ["2026-09-05 22:10:24", 3_794_000, 2_598_000.0, 1_196_000.0, -3_000.0, 20_000.0, -23_000.0],
+    ["2026-09-06 22:10:24", 3_798_000.0, 2_602_000.0, 1_196_000.0, 4_000.0, 4_000.0, 0],
+    ["2026-09-07 22:10:23", 3_918_000.0, 2_721_000.0, 1_197_000.0, 120_000.0, 119_000.0, 1_000.0],
+    ["2026-09-08 22:10:24", 3_852_000.0, 2_658_000.0, 1_194_000.0, -66_000.0, -63_000.0, -3_000.0],
+    ["2026-09-09 22:10:25", 3_859_000.0, 2_661_000.0, 1_198_000.0, 7_000.0, 3_000.0, 4_000.0],
+    ["2026-09-10 22:12:37", 4_087_000.0, 2_643_000.0, 1_444_000.0, 228_000.0, -18_000.0, 246_000.0],
+    ["", 4_087_000.0, 2_643_000.0, 1_444_000.0],
+    ["Total", 4_087_000.0, 2_643_000.0, 1_444_000.0, 1_087_000.0, 843_000.0, 244_000.0],
+]
+
 META = {
     "properties": {"title": "A1 Metrics Dashboard"},
     "sheets": [
@@ -113,6 +144,7 @@ META = {
         {"properties": {"sheetId": 1929369812, "title": "Financing Fees", "gridProperties": {"rowCount": 974, "columnCount": 25}}},
         {"properties": {"sheetId": 1646520473, "title": "Nonclient PNL", "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
         {"properties": {"sheetId": 200816853, "title": "db", "gridProperties": {"rowCount": 2972, "columnCount": 26}}},
+        {"properties": {"sheetId": 1339723141, "title": "A1 database", "gridProperties": {"rowCount": 1000, "columnCount": 41}}},
     ],
 }
 
@@ -123,6 +155,7 @@ TABS: Dict[str, List[List[Any]]] = {
     "Financing Fees": FINANCING_FEES,
     "Nonclient PNL": NONCLIENT_PNL,
     "db": TRADES,
+    "A1 database": A1_DATABASE,
 }
 
 
@@ -620,3 +653,161 @@ def test_factory_builds_sheet_with_adc(monkeypatch):
 def test_constructor_requires_id():
     with pytest.raises(ValueError):
         A1MetricsSheet("", "q")
+
+# ----------------------------------------------------------------------------
+# client flow vs non-client flow ('A1 database'!R:X)
+# ----------------------------------------------------------------------------
+
+def test_parse_client_flow_dates_both_formats_and_drops_undated_rows():
+    df = gsheets.parse_client_flow(A1_DATABASE)
+    assert list(df.columns) == ["date", "realized_total", "realized_client", "realized_nonclient",
+                                "cum_total_ytd", "cum_client_ytd", "cum_nonclient_ytd",
+                                "row_number", "flagged_artifact", "artifact_pair"]
+    assert len(df) == 15                                     # header, asset list, undated history, trailing rows dropped
+    assert df["date"].dt.strftime("%Y-%m-%d").iloc[0] == "2026-08-27"
+    serial = df[df["row_number"] == 7].iloc[0]
+    assert serial["date"] == pd.Timestamp("2026-08-28") and serial["realized_total"] == 20_000.0
+    assert df["date"].is_monotonic_increasing
+    assert df["row_number"].tolist()[:3] == [6, 7, 8]
+    assert df["date"].dt.hour.eq(0).all()                    # normalised to midnight
+    # two snapshots on 09-01 keep both rows in sheet order
+    sep1 = df[df["date"] == "2026-09-01"]
+    assert sep1["row_number"].tolist() == [11, 12]
+    # the row without W / X keeps V and has NaN split
+    short = df[df["row_number"] == 13].iloc[0]
+    assert short["realized_total"] == 60_000.0 and pd.isna(short["realized_client"]) and pd.isna(short["realized_nonclient"])
+    assert short["cum_total_ytd"] == 3_097_000.0
+
+
+def test_parse_client_flow_flags_offsetting_pair_only():
+    df = gsheets.parse_client_flow(A1_DATABASE)
+    flagged = df[df["flagged_artifact"]]
+    assert flagged["row_number"].tolist() == [9, 10]          # the undated 3/4 pair is not in the frame
+    assert flagged["artifact_pair"].tolist() == [9, 9]
+    assert not df[df["row_number"] == 14]["flagged_artifact"].iloc[0]   # +700k has no offsetting neighbour
+    # threshold: a big lone day is not an artefact
+    rows = [["2026-01-01", 0, 0, 0, 5_000_000.0, 5_000_000.0, 0], ["2026-01-02", 0, 0, 0, 1_000.0, 1_000.0, 0]]
+    assert not gsheets.parse_client_flow(rows)["flagged_artifact"].any()
+    # tolerance: the offset must be within 5%
+    rows = [["2026-01-01", 0, 0, 0, 5_000_000.0, 5_000_000.0, 0], ["2026-01-02", 0, 0, 0, -4_000_000.0, -4_000_000.0, 0]]
+    assert not gsheets.parse_client_flow(rows)["flagged_artifact"].any()
+    rows = [["2026-01-01", 0, 0, 0, 5_000_000.0, 5_000_000.0, 0], ["2026-01-02", 0, 0, 0, -4_900_000.0, -4_900_000.0, 0]]
+    assert gsheets.parse_client_flow(rows)["flagged_artifact"].all()
+
+
+def test_parse_client_flow_empty_and_first_row_offset():
+    empty = gsheets.parse_client_flow([])
+    assert empty.empty and "flagged_artifact" in empty.columns
+    assert gsheets.parse_client_flow([["Client Flow PNL", "x"], ["not a date", 1, 2, 3, 4, 5, 6]]).empty
+    df = gsheets.parse_client_flow(A1_DATABASE[5:7], first_row=6)
+    assert df["row_number"].tolist() == [6, 7]
+
+
+def test_client_flow_daily_accessor_filters_and_attrs():
+    sess = FakeSession()
+    sheet = make_sheet(session=sess)
+    df = sheet.client_flow_daily()
+    assert len(df) == 15
+    assert df.attrs["tab"] == "A1 database" and df.attrs["range"] == "R:X"
+    assert df.attrs["data_as_of"] == "2026-09-11"            # from the dashboard tab - this tab has no as-of cell
+    assert df.attrs["first_row_date"] == "2026-08-27" and df.attrs["last_row_date"] == "2026-09-10"
+    assert df.attrs["n_rows_total"] == 15
+    sub = sheet.client_flow_daily("2026-09-05", "2026-09-10")
+    assert len(sub) == 6 and sub["row_number"].tolist() == [15, 16, 17, 18, 19, 20]
+    assert sub.attrs["last_row_date"] == "2026-09-10"        # attrs describe the whole tab
+    only_start = sheet.client_flow_daily(start=pd.Timestamp("2026-09-09"))
+    assert only_start["date"].dt.strftime("%Y-%m-%d").tolist() == ["2026-09-09", "2026-09-10"]
+    # the R:X range is fetched once and cached
+    rx_calls = [c for c in sess.calls if "R%3AX" in c["url"] or "R:X" in c["url"]]
+    assert len(rx_calls) == 1
+
+
+def test_client_flow_window_dashboard_week_matches_weekly_tab():
+    sheet = make_sheet()
+    res = sheet.client_flow_window("2026-09-04", "2026-09-10")
+    assert res["start"] == "2026-09-04" and res["end"] == "2026-09-10"
+    assert res["n_rows"] == 6 and res["n_days"] == 6
+    assert res["sums"] == {"realized_total": 290_000.0, "realized_client": 65_000.0, "realized_nonclient": 225_000.0}
+    assert res["sums_all_rows"] == res["sums"]
+    assert abs(res["client_share"] - 65_000 / 290_000) < 1e-12 and abs(res["nonclient_share"] - 225_000 / 290_000) < 1e-12
+    assert res["missing_days"] == ["2026-09-04 (Fri)"] and res["missing_weekdays"] == ["2026-09-04 (Fri)"]
+    assert res["not_populated"] == [] and res["artifact_rows"] == [] and res["incomplete_rows"] == []
+    assert res["duplicate_dates"] == []
+    wc = res["weekly_check"]
+    assert wc["week"] == 36 and wc["a1_realized"] == 290_000.0 and wc["difference"] == 0.0
+    assert wc["a1_unrealized"] == 285_000.0
+    assert res["ytd_check"] is None
+    assert res["rows"]["row_number"].tolist() == [15, 16, 17, 18, 19, 20] and res["excluded"].empty
+
+
+def test_client_flow_window_keeps_full_pair_and_reports_weekly_mismatch():
+    sheet = make_sheet()
+    res = sheet.client_flow_window("2026-08-28", "2026-09-03")
+    # 20k + 5k + (8.0M - 7.99M) + 3k - 1k + 60k + 700k
+    assert res["sums"]["realized_total"] == pytest.approx(797_000.0)
+    assert res["sums"]["realized_client"] == pytest.approx(15_000 + 4_000 + 8_000 + 3_000 - 2_000 + 710_000)
+    assert res["sums"]["realized_nonclient"] == pytest.approx(5_000 + 1_000 + 2_000 + 0 + 1_000 - 10_000)
+    assert res["n_rows"] == 8 and res["n_days"] == 7                    # two snapshots on 09-01
+    assert res["duplicate_dates"] == ["2026-09-01"]
+    assert res["incomplete_rows"] == [{"row_number": 13, "date": "2026-09-02"}]
+    assert [a["action"].split(" - ")[0] for a in res["artifact_rows"]] == ["kept", "kept"]
+    assert [a["row_number"] for a in res["artifact_rows"]] == [9, 10]
+    assert res["artifact_net"] == pytest.approx(10_000.0)
+    assert res["excluded"].empty
+    wc = res["weekly_check"]
+    assert wc["week"] == 35 and wc["a1_realized"] == 1_400_000.0 and wc["difference"] == pytest.approx(-603_000.0)
+    assert res["missing_days"] == []
+
+
+def test_client_flow_window_excludes_lone_artifact_leg_and_discloses():
+    sheet = make_sheet()
+    res = sheet.client_flow_window("2026-08-27", "2026-08-30")
+    assert res["sums"]["realized_total"] == 35_000.0                   # 10k + 20k + 5k, the +8M leg excluded
+    assert res["sums_all_rows"]["realized_total"] == 8_035_000.0
+    assert res["n_rows"] == 3 and len(res["excluded"]) == 1 and res["excluded"]["row_number"].iloc[0] == 9
+    assert len(res["artifact_rows"]) == 1
+    a = res["artifact_rows"][0]
+    assert a["row_number"] == 9 and a["date"] == "2026-08-30" and a["realized_total"] == 8_000_000.0
+    assert a["action"].startswith("excluded")
+    assert res["weekly_check"] is None                                 # not a dashboard week
+    kept = sheet.client_flow_window("2026-08-27", "2026-08-30", exclude_artifacts=False)
+    assert kept["sums"]["realized_total"] == 8_035_000.0 and kept["excluded"].empty
+    assert kept["artifact_rows"][0]["action"].startswith("kept")
+
+
+def test_client_flow_window_future_days_and_empty_window():
+    sheet = make_sheet()
+    res = sheet.client_flow_window("2026-09-08", "2026-09-14")
+    assert res["n_rows"] == 3 and res["missing_days"] == []
+    assert res["not_populated"] == ["2026-09-11", "2026-09-12", "2026-09-13", "2026-09-14"]
+    assert res["last_row_date"] == "2026-09-10"
+    empty = sheet.client_flow_window("2026-10-01", "2026-10-05")
+    assert empty["n_rows"] == 0 and empty["sums"] == {"realized_total": 0.0, "realized_client": 0.0, "realized_nonclient": 0.0}
+    assert empty["client_share"] is None and empty["missing_days"] == []
+    assert empty["not_populated"] == ["2026-10-0%d" % d for d in range(1, 6)]
+    # reversed dates are swapped; non-dates raise
+    swapped = sheet.client_flow_window("2026-09-10", "2026-09-04")
+    assert swapped["start"] == "2026-09-04" and swapped["sums"]["realized_total"] == 290_000.0
+    with pytest.raises(ValueError):
+        sheet.client_flow_window("nope", "2026-09-04")
+
+
+def test_client_flow_window_ytd_check_uses_cumulative_columns():
+    sheet = make_sheet()
+    res = sheet.client_flow_window("2026-01-01", "2026-09-10")
+    yc = res["ytd_check"]
+    assert yc["date"] == "2026-09-10" and yc["row_number"] == 20
+    assert yc["cum_total"] == 4_087_000.0 and yc["cum_client"] == 2_643_000.0 and yc["cum_nonclient"] == 1_444_000.0
+    assert yc["diff_total"] == pytest.approx(res["sums"]["realized_total"] - 4_087_000.0)
+    # missing days are only counted up to the last populated row
+    assert "2026-09-04 (Fri)" in res["missing_days"] and not any(d.startswith("2026-09-11") for d in res["missing_days"])
+    assert res["not_populated"] == []
+
+
+def test_client_flow_window_missing_days_split_weekdays():
+    # window with a missing weekend day: drop 08-29 (Sat) via a trimmed payload
+    tab = [r for r in A1_DATABASE if not (r and r[0] == "2026-08-29 22:10:24")]
+    sheet = make_sheet(session=FakeSession(tabs={**TABS, "A1 database": tab}))
+    res = sheet.client_flow_window("2026-08-27", "2026-09-05")
+    assert res["missing_days"] == ["2026-08-29 (Sat)", "2026-09-04 (Fri)"]
+    assert res["missing_weekdays"] == ["2026-09-04 (Fri)"]

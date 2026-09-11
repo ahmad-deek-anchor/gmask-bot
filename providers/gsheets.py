@@ -33,6 +33,18 @@ row numbers):
     block ``Week | HOLD Financing Fees | HOLD Delta Sales | Total`` (G-J). No as-of cell.
 ``Nonclient PNL``
     only a title ("HOLD PNL") and a link to another spreadsheet - not populated here.
+``A1 database`` (helper tab; only columns R:X are read, tab has no as-of cell)
+    row 1  ``T:X`` headers ``Client Flow PNL | Non Client Flow PNL | Change in Total PNL |
+           Change in Client Flow PNL | Change in non Client Flow PNL`` (R1:S9 hold an
+           unrelated asset / volume list). Rows 2-224: undated history (R blank).
+           From row 225 (2025-07-24) on, R = snapshot datetime string
+           ``YYYY-MM-DD HH:MM:SS`` (~22:10 UTC; a Google serial number is accepted too),
+           S = cumulative YTD total realised PnL (= T + U), T / U = cumulative YTD
+           client-flow / non-client-flow realised PnL (reset to 0 on Jan 1), V / W / X =
+           that day's realised total / client-flow / non-client-flow PnL. Some dates
+           are missing (no row), one date has two snapshots, and the series carries
+           offsetting artefact pairs (e.g. +$12.0M / -$12.0M on 2025-08-14/15) that the
+           desk's weekly totals include net - see ``parse_client_flow``.
 ``db`` (counterparty trade blotter, one row per A1 client trade)
     ``Date (UTC) | Counterparty | Side | Symbol | Buy QTY | Buy Asset | Sell QTY |
     Sell Asset | Price | PNL | Currency | bps | Month``. Covers 2024 only (the fuller
@@ -78,6 +90,7 @@ TAB_WEEKLY_PNL = "Weekly PNL"
 TAB_NONCLIENT_PNL = "Nonclient PNL"
 TAB_FINANCING_FEES = "Financing Fees"
 TAB_COUNTERPARTY_TRADES = "db"      # the trade-level blotter; 'Counterparty Trades' is a summary tab
+TAB_A1_DATABASE = "A1 database"     # daily realised PnL split client flow / non-client flow (cols R:X)
 
 # generous ranges: the tabs are ~20 wide and < 60 rows; the blotter is read whole
 RANGE_VOLUME_PNL = "A1:T40"
@@ -85,6 +98,13 @@ RANGE_WEEKLY_PNL = "A1:N80"
 RANGE_FINANCING_FEES = "A1:L70"
 RANGE_NONCLIENT_PNL = "A1:Z40"
 RANGE_TRADES = "A:M"
+RANGE_A1_DATABASE = "R:X"
+
+# artefact detection in the A1 database daily series: a day whose |realised total| is at
+# least ARTIFACT_MIN_ABS and whose neighbouring row offsets it to within ARTIFACT_OFFSET_TOL
+# (relative) is an erroneous booking + reversal pair, not real daily PnL.
+ARTIFACT_MIN_ABS = 1_000_000.0
+ARTIFACT_OFFSET_TOL = 0.05
 
 ENTITY_ALIASES = {
     "HOLD": "HOLD",
@@ -372,6 +392,7 @@ class A1MetricsSheet:
             "nonclient_pnl": TAB_NONCLIENT_PNL,
             "financing_fees": TAB_FINANCING_FEES,
             "trades": TAB_COUNTERPARTY_TRADES,
+            "a1_database": TAB_A1_DATABASE,
         }
 
     @classmethod
@@ -672,6 +693,175 @@ class A1MetricsSheet:
         return df
 
 
+    # ------------------------------------------------------------------ client vs non-client flow
+
+    def client_flow_daily(self, start=None, end=None) -> pd.DataFrame:
+        """Daily A1 realised PnL split into client flow and non-client (proprietary) flow,
+        from ``'A1 database'!R:X`` (one cached read).
+
+        Columns: date (datetime64, normalised), realized_total (V), realized_client (W),
+        realized_nonclient (X), cum_total_ytd (S), cum_client_ytd (T), cum_nonclient_ytd
+        (U), row_number (1-based sheet row), flagged_artifact (bool), artifact_pair (row
+        number of the first leg of the offsetting pair, <NA> otherwise). Undated rows are
+        dropped; rows are sorted by date then sheet row (one date can carry two
+        snapshots). `start` / `end` (inclusive, anything parse_sheet_date accepts) filter
+        by date. Artefact rows are **kept** with flagged_artifact=True so callers can
+        exclude and disclose them. attrs: tab, range, data_as_of (the dashboard's - this
+        tab has no as-of cell), first_row_date, last_row_date, n_rows_total.
+        """
+        tab = self.tabs["a1_database"]
+        rows = self.get_range(tab, RANGE_A1_DATABASE)
+        full = parse_client_flow(rows)
+        df = full
+        s_ts = parse_sheet_date(start) if start is not None else None
+        e_ts = parse_sheet_date(end) if end is not None else None
+        if s_ts is not None:
+            df = df[df["date"] >= s_ts.normalize()]
+        if e_ts is not None:
+            df = df[df["date"] <= e_ts.normalize()]
+        df = df.reset_index(drop=True)
+        df.attrs["tab"] = tab
+        df.attrs["range"] = RANGE_A1_DATABASE
+        df.attrs["data_as_of"] = self.dashboard_as_of()
+        df.attrs["first_row_date"] = full["date"].min().strftime("%Y-%m-%d") if len(full) else None
+        df.attrs["last_row_date"] = full["date"].max().strftime("%Y-%m-%d") if len(full) else None
+        df.attrs["n_rows_total"] = int(len(full))
+        return df
+
+    def client_flow_window(self, start, end, exclude_artifacts: bool = True) -> Dict[str, Any]:
+        """Sums of the client / non-client realised PnL split over [start, end] with the
+        bookkeeping a careful analyst would do by hand.
+
+        Artefact policy (verified against the desk's 'Weekly PNL' tab, which includes the
+        offsetting pairs net): when **both** legs of a flagged pair fall inside the window
+        they are kept (they net to the residual real PnL of those two days) and disclosed;
+        a leg whose partner lies outside the window is excluded when exclude_artifacts is
+        True (it would otherwise swing the total by millions) and disclosed.
+
+        Returns a dict: start, end, tab, range, data_as_of, first_row_date, last_row_date,
+        rows (DataFrame of the rows used, artefact legs excluded), excluded (DataFrame),
+        n_rows, n_days, sums {realized_total, realized_client, realized_nonclient}, sums_all_rows
+        (same, nothing excluded), client_share / nonclient_share (fractions of total, None
+        when total is 0), artifact_rows (list of dicts with an `action`), artifact_net
+        (net of kept pairs), missing_days / missing_weekdays (calendar days in the window
+        up to the last populated row with no sheet row, 'YYYY-MM-DD (Dow)'), not_populated
+        (days in the window after the last populated row), incomplete_rows (rows lacking
+        the W / X split), duplicate_dates, weekly_check (None or {week, start_date,
+        end_date, a1_realized, a1_unrealized, difference} when the window equals a
+        dashboard week), ytd_check (None or the sheet's cumulative S/T/U values at the
+        last row of the window with differences vs the summed rows, for windows that
+        start on Jan 1).
+        """
+        s_ts = parse_sheet_date(start)
+        e_ts = parse_sheet_date(end)
+        if s_ts is None or e_ts is None:
+            raise ValueError(f"start / end must be dates, got {start!r} / {end!r}")
+        s_ts, e_ts = s_ts.normalize(), e_ts.normalize()
+        if e_ts < s_ts:
+            s_ts, e_ts = e_ts, s_ts
+        df = self.client_flow_daily(s_ts, e_ts)
+        last_row = df.attrs.get("last_row_date")
+        last_ts = pd.Timestamp(last_row) if last_row else None
+
+        artifact_rows: List[Dict[str, Any]] = []
+        drop_idx = []
+        art_net = 0.0
+        if len(df) and df["flagged_artifact"].any():
+            flagged = df[df["flagged_artifact"]]
+            in_window = set(int(r) for r in flagged["row_number"].tolist())
+            for pair_id, legs in flagged.groupby("artifact_pair"):
+                full_pair = client_flow_pair_complete(legs, in_window)
+                for idx, leg in legs.iterrows():
+                    if full_pair:
+                        action = "kept - both legs in window, they net out"
+                        art_net += float(leg["realized_total"]) if leg["realized_total"] == leg["realized_total"] else 0.0
+                    elif exclude_artifacts:
+                        action = "excluded - offsetting leg is outside the window"
+                        drop_idx.append(idx)
+                    else:
+                        action = "kept - offsetting leg is outside the window (exclude_artifacts=False)"
+                    artifact_rows.append({
+                        "row_number": int(leg["row_number"]), "date": leg["date"].strftime("%Y-%m-%d"),
+                        "realized_total": float(leg["realized_total"]), "realized_client": float(leg["realized_client"]),
+                        "realized_nonclient": float(leg["realized_nonclient"]), "pair": int(pair_id), "action": action,
+                    })
+        excluded = df.loc[drop_idx] if drop_idx else df.iloc[0:0]
+        used = df.drop(index=drop_idx) if drop_idx else df
+
+        def sums(frame: pd.DataFrame) -> Dict[str, float]:
+            return {c: float(frame[c].sum(skipna=True)) if len(frame) else 0.0
+                    for c in ("realized_total", "realized_client", "realized_nonclient")}
+        total = sums(used)
+        tot = total["realized_total"]
+        share_c = total["realized_client"] / tot if tot else None
+        share_n = total["realized_nonclient"] / tot if tot else None
+
+        # coverage
+        upto = min(e_ts, last_ts) if last_ts is not None else e_ts
+        missing: List[str] = []
+        missing_wd: List[str] = []
+        if upto >= s_ts:
+            have = set(pd.DatetimeIndex(df["date"]).normalize()) if len(df) else set()
+            for d in pd.date_range(s_ts, upto):
+                if d not in have:
+                    label = f"{d.strftime('%Y-%m-%d')} ({d.strftime('%a')})"
+                    missing.append(label)
+                    if d.weekday() < 5:
+                        missing_wd.append(label)
+        not_populated = [d.strftime("%Y-%m-%d") for d in pd.date_range(max(s_ts, upto + timedelta(days=1)), e_ts)] \
+            if last_ts is not None and e_ts > last_ts else []
+        incomplete = used[used["realized_client"].isna() | used["realized_nonclient"].isna()] if len(used) else used
+        dup = df["date"][df["date"].duplicated()].dt.strftime("%Y-%m-%d").unique().tolist() if len(df) else []
+
+        weekly_check = None
+        try:
+            wk = self.weekly_pnl(include_future=True)
+            hit = wk[(~wk["is_total"]) & (wk["start_date"] == s_ts) & (wk["end_date"] == e_ts)]
+            if len(hit):
+                w = hit.iloc[0]
+                a1r = float(w["a1_realized"]) if w["a1_realized"] == w["a1_realized"] else None
+                weekly_check = {
+                    "week": int(w["week"]), "start_date": s_ts.strftime("%Y-%m-%d"), "end_date": e_ts.strftime("%Y-%m-%d"),
+                    "a1_realized": a1r,
+                    "a1_unrealized": float(w["a1_unrealized"]) if w["a1_unrealized"] == w["a1_unrealized"] else None,
+                    "difference": (tot - a1r) if a1r is not None else None,
+                }
+        except SheetsAccessError:
+            raise
+        except Exception as e:  # noqa: BLE001 - the cross-check is best effort
+            logger.debug("weekly cross-check unavailable: %s", e)
+
+        ytd_check = None
+        if len(used) and s_ts.month == 1 and s_ts.day == 1 and e_ts.year == s_ts.year:
+            last = used.sort_values(["date", "row_number"]).iloc[-1]
+            if last["cum_total_ytd"] == last["cum_total_ytd"]:
+                cc = float(last["cum_client_ytd"]) if last["cum_client_ytd"] == last["cum_client_ytd"] else float("nan")
+                cn = float(last["cum_nonclient_ytd"]) if last["cum_nonclient_ytd"] == last["cum_nonclient_ytd"] else float("nan")
+                ytd_check = {
+                    "date": last["date"].strftime("%Y-%m-%d"), "row_number": int(last["row_number"]),
+                    "cum_total": float(last["cum_total_ytd"]), "cum_client": cc, "cum_nonclient": cn,
+                    "diff_total": tot - float(last["cum_total_ytd"]),
+                    "diff_client": total["realized_client"] - cc, "diff_nonclient": total["realized_nonclient"] - cn,
+                }
+
+        return {
+            "start": s_ts.strftime("%Y-%m-%d"), "end": e_ts.strftime("%Y-%m-%d"),
+            "ytd_check": ytd_check,
+            "tab": df.attrs.get("tab"), "range": df.attrs.get("range"), "data_as_of": df.attrs.get("data_as_of"),
+            "first_row_date": df.attrs.get("first_row_date"), "last_row_date": last_row,
+            "rows": used.reset_index(drop=True), "excluded": excluded.reset_index(drop=True),
+            "n_rows": int(len(used)), "n_days": int(used["date"].nunique()) if len(used) else 0,
+            "sums": total, "sums_all_rows": sums(df),
+            "client_share": share_c, "nonclient_share": share_n,
+            "artifact_rows": artifact_rows, "artifact_net": art_net if artifact_rows else 0.0,
+            "missing_days": missing, "missing_weekdays": missing_wd, "not_populated": not_populated,
+            "incomplete_rows": [{"row_number": int(r["row_number"]), "date": r["date"].strftime("%Y-%m-%d")}
+                                for _, r in incomplete.iterrows()],
+            "duplicate_dates": dup,
+            "weekly_check": weekly_check,
+        }
+
+
 # ---------------------------------------------------------------------------
 # pure parsers (operate on the raw `values` payload; unit-tested offline)
 # ---------------------------------------------------------------------------
@@ -934,14 +1124,93 @@ def parse_trades(rows: Sequence[Sequence[Any]]) -> pd.DataFrame:
     return df.sort_values("date").reset_index(drop=True)
 
 
+_CLIENT_FLOW_COLS = ["date", "realized_total", "realized_client", "realized_nonclient",
+                     "cum_total_ytd", "cum_client_ytd", "cum_nonclient_ytd",
+                     "row_number", "flagged_artifact", "artifact_pair"]
+
+
+def parse_client_flow(rows: Sequence[Sequence[Any]], first_row: int = 1,
+                      artifact_min_abs: float = ARTIFACT_MIN_ABS,
+                      artifact_tol: float = ARTIFACT_OFFSET_TOL) -> pd.DataFrame:
+    """``'A1 database'!R:X`` values -> typed daily frame (see A1MetricsSheet.client_flow_daily).
+
+    Column offsets within the payload are fixed (R..X -> 0..6): R date, S cumulative
+    total, T cumulative client, U cumulative non-client, V daily total, W daily client,
+    X daily non-client. Rows whose R is not a date (header, the asset list, the undated
+    history, blanks) are dropped; dates may be strings or Google serial numbers and are
+    normalised to midnight. `first_row` is the sheet row of rows[0] (1 for an R:X read).
+
+    Artefact flagging: a row with |V| >= artifact_min_abs whose neighbouring dated row
+    (previous or next in sheet order) has the opposite sign and |V_i + V_j| <= artifact_tol
+    * |V_i| is an offsetting booking pair; both legs get flagged_artifact=True and
+    artifact_pair = the first leg's row number.
+    """
+    recs = []
+    for i, row in enumerate(rows):
+        raw_date = row[0] if row else None
+        if _is_blank(raw_date):
+            continue
+        ts = parse_sheet_date(raw_date)
+        if ts is None:
+            continue
+        vals = [to_float(row[c]) if c < len(row) else float("nan") for c in range(1, 7)]
+        if all(v != v for v in vals):
+            continue
+        recs.append({
+            "date": ts.normalize(),
+            "realized_total": vals[3], "realized_client": vals[4], "realized_nonclient": vals[5],
+            "cum_total_ytd": vals[0], "cum_client_ytd": vals[1], "cum_nonclient_ytd": vals[2],
+            "row_number": first_row + i,
+        })
+    df = pd.DataFrame(recs, columns=_CLIENT_FLOW_COLS[:8])
+    df["flagged_artifact"] = False
+    df["artifact_pair"] = pd.array([None] * len(df), dtype="Int64")
+    if not len(df):
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+    df = df.sort_values(["row_number"]).reset_index(drop=True)
+    v = df["realized_total"].tolist()
+    n = len(v)
+    for i in range(n):
+        vi = v[i]
+        if vi != vi or abs(vi) < artifact_min_abs:
+            continue
+        for j in (i - 1, i + 1):
+            if not 0 <= j < n:
+                continue
+            vj = v[j]
+            if vj != vj or vi * vj >= 0:
+                continue
+            if abs(vi + vj) <= artifact_tol * abs(vi):
+                pair = int(df.at[min(i, j), "row_number"])
+                for k in (i, j):
+                    df.at[k, "flagged_artifact"] = True
+                    if pd.isna(df.at[k, "artifact_pair"]):
+                        df.at[k, "artifact_pair"] = pair
+                break
+    df["date"] = pd.to_datetime(df["date"])
+    df["flagged_artifact"] = df["flagged_artifact"].astype(bool)
+    return df.sort_values(["date", "row_number"]).reset_index(drop=True)
+
+
+def client_flow_pair_complete(legs: pd.DataFrame, in_window: set) -> bool:
+    """True when a flagged pair has both of its legs inside the window (`in_window` is the
+    set of row numbers present). A pair always has exactly two legs; a lone leg means the
+    partner row lies outside the requested date range."""
+    return len(legs) >= 2 and all(int(r) in in_window for r in legs["row_number"])
+
+
 __all__ = [
     "A1MetricsSheet",
     "ADC_LOGIN_CMD",
+    "ARTIFACT_MIN_ABS",
+    "ARTIFACT_OFFSET_TOL",
     "SHEETS_SCOPE",
     "SheetsAccessError",
     "SheetsUnavailable",
     "clamp_a1_range",
     "parse_a1_range",
+    "parse_client_flow",
     "parse_financing_fees",
     "parse_generic_table",
     "parse_monthly_volume_pnl",

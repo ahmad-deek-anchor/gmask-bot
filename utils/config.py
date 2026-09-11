@@ -31,6 +31,8 @@ Long-term memory + daily snapshots (providers/memory_store.py):
 MEMORY_DB_URL         env MEMORY_DB_URL        (default sqlite:///data/memory.db; postgresql://... needs psycopg)
 MEMORY_EPISODE_TTL_DAYS env MEMORY_EPISODE_TTL_DAYS (default 90; conversation summaries expire)
 MEMORY_EMBEDDINGS     env MEMORY_EMBEDDINGS    (default vertex = text-embedding-005 with keyword fallback; off = keyword only)
+SNAPSHOT_BACKEND      env SNAPSHOT_BACKEND     (default sqlite = snapshots table inside MEMORY_DB_URL; bigquery = shared table below)
+SNAPSHOT_BQ_TABLE     env SNAPSHOT_BQ_TABLE    (default anchorage-corp-eng-playground.gmask_bot.snapshots; written by the Cloud Run job)
 
 Spot desk PnL in the "A1 Metrics Dashboard" Google Sheet (providers/gsheets.py, read-only):
 A1_METRICS_SHEET_ID   env A1_METRICS_SHEET_ID  (default 1BksNxC2QXHLjFJNCuv-GC9JOBHeb8EyoGwzTuNwqNSY)
@@ -73,6 +75,11 @@ DEFAULT_BQ_CATALOG_PATH = "data/bq_catalog.json"
 DEFAULT_MEMORY_DB_URL = "sqlite:///data/memory.db"
 DEFAULT_MEMORY_EPISODE_TTL_DAYS = 90
 DEFAULT_MEMORY_EMBEDDINGS = "vertex"
+# Daily snapshots: "sqlite" keeps them in the memory database; "bigquery" uses the shared
+# table that the Cloud Run job (deploy/deploy_snapshot_job.sh) writes and the bot reads.
+DEFAULT_SNAPSHOT_BACKEND = "sqlite"
+DEFAULT_SNAPSHOT_BQ_TABLE = "anchorage-corp-eng-playground.gmask_bot.snapshots"
+SNAPSHOT_BACKENDS = ("sqlite", "bigquery")
 
 # Spot desk PnL sheet ("A1 Metrics Dashboard", maintained daily by the desk). Read
 # with Application Default Credentials (user account, spreadsheets.readonly scope);
@@ -127,6 +134,8 @@ class Config:
         self.MEMORY_DB_URL = os.getenv("MEMORY_DB_URL", DEFAULT_MEMORY_DB_URL)
         self.MEMORY_EPISODE_TTL_DAYS = _int_env("MEMORY_EPISODE_TTL_DAYS", DEFAULT_MEMORY_EPISODE_TTL_DAYS)
         self.MEMORY_EMBEDDINGS = os.getenv("MEMORY_EMBEDDINGS", DEFAULT_MEMORY_EMBEDDINGS)
+        self.SNAPSHOT_BACKEND = (os.getenv("SNAPSHOT_BACKEND") or DEFAULT_SNAPSHOT_BACKEND).strip().lower()
+        self.SNAPSHOT_BQ_TABLE = os.getenv("SNAPSHOT_BQ_TABLE") or DEFAULT_SNAPSHOT_BQ_TABLE
 
         # Spot desk PnL Google Sheet (read-only; see providers/gsheets.py)
         self.A1_METRICS_SHEET_ID = os.getenv("A1_METRICS_SHEET_ID", DEFAULT_A1_METRICS_SHEET_ID)

@@ -1,16 +1,20 @@
-# systemd --user oneshot: daily data snapshot (Haruko desk risk, market signals, spot
-# desk PnL sheet) into the memory store's `snapshots` table (data/memory.db by default).
-# Triggered by trading-signals-snapshot.timer. Not enabled by default.
+# systemd --user oneshot: daily data snapshot of the sources that need the user's own
+# credentials - Haruko desk risk (anc-global-markets BigQuery) and the spot desk PnL
+# Google Sheet - into the shared snapshots table (SNAPSHOT_BACKEND from .env; bigquery in
+# production). The `signals` source runs in Google Cloud instead (Cloud Run job
+# trading-signals-snapshot, deploy/deploy_snapshot_job.sh) because this machine sleeps.
+# Triggered by trading-signals-snapshot.timer.
 [Unit]
-Description=Trading signals daily data snapshot -> memory store
+Description=Trading signals daily data snapshot (haruko, sheet) -> snapshot store
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 WorkingDirectory=/home/ahmaddeek/program/signals-main
-ExecStart=/home/ahmaddeek/program/signals-main/.venv/bin/python snapshot_daily.py --verbose
+ExecStart=/home/ahmaddeek/program/signals-main/.venv/bin/python snapshot_daily.py --sources haruko,sheet --verbose
 Environment=PYTHONUNBUFFERED=1
-# Optional: MEMORY_DB_URL=sqlite:///data/memory.db (default) or postgresql://...
-# EnvironmentFile=-%h/program/signals-main/.env
+# .env carries SNAPSHOT_BACKEND=bigquery (and any MEMORY_DB_URL / SNAPSHOT_BQ_TABLE override);
+# snapshot_daily.py also load_dotenv()s it itself, this just keeps systemd's view identical.
+EnvironmentFile=-%h/program/signals-main/.env
 TimeoutStartSec=20min

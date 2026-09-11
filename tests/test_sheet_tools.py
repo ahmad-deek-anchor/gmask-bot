@@ -7,6 +7,7 @@ payload to markdown.
 
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 from providers.gsheets import A1MetricsSheet, SheetsAccessError, SheetsUnavailable
@@ -17,6 +18,7 @@ from tools.sheet_tools import (
     MAX_RANGE_ROWS,
     SHEET_TOOL_NAMES,
     UNAVAILABLE,
+    get_a1_client_flow_split,
     get_counterparty_pnl,
     get_financing_fees,
     get_nonclient_pnl,
@@ -25,6 +27,7 @@ from tools.sheet_tools import (
     get_weekly_spot_pnl,
     list_a1_dashboard_tabs,
     read_a1_dashboard_range,
+    resolve_client_flow_window,
 )
 
 
@@ -56,7 +59,7 @@ def test_tool_registry():
     tools = get_sheet_tools()
     assert SHEET_TOOL_NAMES == [
         "get_spot_pnl_summary", "get_weekly_spot_pnl", "get_counterparty_pnl", "get_financing_fees",
-        "get_nonclient_pnl", "list_a1_dashboard_tabs", "read_a1_dashboard_range",
+        "get_nonclient_pnl", "get_a1_client_flow_split", "list_a1_dashboard_tabs", "read_a1_dashboard_range",
     ]
     assert all(t.description for t in tools)
     for t in tools:
@@ -303,7 +306,8 @@ def test_nonclient_pnl_with_table(monkeypatch):
 
 def test_list_tabs(sheet):
     out = list_a1_dashboard_tabs.invoke({})
-    assert out.startswith("**A1 Metrics Dashboard** - 6 tab(s)")
+    assert out.startswith("**A1 Metrics Dashboard** - 7 tab(s)")
+    assert "get_a1_client_flow_split" in out
     assert "| Volume & PNL | 1000 x 29 | get_spot_pnl_summary |" in out
     assert "| 2025 Volume & PNL | 1000 x 29 | get_spot_pnl_summary(year=2025) |" in out
     assert "| db | 2972 x 26 | get_counterparty_pnl (trade blotter) |" in out
@@ -354,3 +358,133 @@ def test_read_range_never_writes(sheet):
     for call in sheet._session.calls:
         assert "/values/" in call["url"] or call["url"].endswith("sheet-id-123")
         assert ":append" not in call["url"] and ":batchUpdate" not in call["url"]
+
+# ----------------------------------------------------------------------------
+# get_a1_client_flow_split
+# ----------------------------------------------------------------------------
+
+ANCHOR = pd.Timestamp("2026-09-11")     # the canned dashboard's "Data as of" (a Friday)
+
+
+def _weeks(sheet):
+    return sheet.weekly_pnl(include_future=True)
+
+
+def test_resolve_window_shortcuts_anchor_on_data_as_of(sheet):
+    wk = _weeks(sheet)
+    d = lambda s: pd.Timestamp(s)  # noqa: E731
+    assert resolve_client_flow_window("last week", None, ANCHOR, wk) == (d("2026-09-04"), d("2026-09-10"), "last week = dashboard week 36")
+    s_, e_, label = resolve_client_flow_window("This Week", None, ANCHOR, wk)
+    assert (s_, e_) == (d("2026-09-11"), d("2026-09-17")) and label.startswith("this week = dashboard week 37")
+    assert resolve_client_flow_window("mtd", None, ANCHOR, wk)[:2] == (d("2026-09-01"), d("2026-09-11"))
+    assert resolve_client_flow_window("month to date", None, ANCHOR, wk)[2] == "month to date"
+    assert resolve_client_flow_window("YTD", None, ANCHOR, wk) == (d("2026-01-01"), d("2026-09-11"), "year to date")
+    assert resolve_client_flow_window("last month", None, ANCHOR, wk) == (d("2026-08-01"), d("2026-08-31"), "last month")
+    assert resolve_client_flow_window("last 7 days", None, ANCHOR, wk) == (d("2026-09-05"), d("2026-09-11"), "last 7 days")
+    assert resolve_client_flow_window("past 30 days", "ignored", ANCHOR, wk)[0] == d("2026-08-13")
+    assert resolve_client_flow_window("yesterday", None, ANCHOR, wk) == (d("2026-09-10"), d("2026-09-10"), "yesterday")
+    # explicit dates: single day, pair, reversed pair, 'today' as end
+    assert resolve_client_flow_window("2026-09-04", None, ANCHOR, wk) == (d("2026-09-04"), d("2026-09-04"), "2026-09-04")
+    assert resolve_client_flow_window("2026-09-04", "2026-09-10", ANCHOR, wk)[2] == "2026-09-04 to 2026-09-10"
+    assert resolve_client_flow_window("2026-09-10", "2026-09-04", ANCHOR, wk)[:2] == (d("2026-09-04"), d("2026-09-10"))
+    assert resolve_client_flow_window("Sep 4, 2026", "today", ANCHOR, wk)[:2] == (d("2026-09-04"), ANCHOR)
+    # wall clock never used: a different anchor moves every shortcut
+    other = pd.Timestamp("2026-03-15")
+    assert resolve_client_flow_window("mtd", None, other, wk)[:2] == (d("2026-03-01"), other)
+    with pytest.raises(ValueError, match="start_date"):
+        resolve_client_flow_window("whenever", None, ANCHOR, wk)
+    with pytest.raises(ValueError, match="end_date"):
+        resolve_client_flow_window("2026-09-04", "later", ANCHOR, wk)
+
+
+def test_resolve_window_week_fallback_without_weekly_tab():
+    d = lambda s: pd.Timestamp(s)  # noqa: E731
+    assert resolve_client_flow_window("last week", None, ANCHOR, None) == (d("2026-09-04"), d("2026-09-10"), "last week")
+    assert resolve_client_flow_window("this week", None, pd.Timestamp("2026-09-09"), None)[:2] == (d("2026-09-04"), d("2026-09-10"))
+    # an anchor outside the weekly tab's dates also falls back to Fri-Thu weeks
+    assert resolve_client_flow_window("last week", None, pd.Timestamp("2027-06-16"), None)[:2] == (d("2027-06-04"), d("2027-06-10"))
+
+
+def test_client_flow_split_explicit_week_markdown(sheet):
+    out = get_a1_client_flow_split.invoke({"start_date": "2026-09-04", "end_date": "2026-09-10"})
+    lines = out.split("\n")
+    assert lines[0] == "**A1 spot realised PnL - client flow vs non-client (proprietary) flow**"
+    assert lines[1] == "Window: 2026-09-04 to 2026-09-10 - 6 populated day-row(s), sheet rows 15-20."
+    assert "Data as of: **2026-09-11**" in lines[2] and "last populated row in 'A1 database' is 2026-09-10" in lines[2]
+    assert SOURCE_MARKER in out and "tab 'A1 database' columns R:X" in out and "not the Haruko" in out
+    assert "**Totals:** realised $290,000 = client flow $65,000 (22.4%) + non-client flow $225,000 (77.6%) over 6 day(s)" in out
+    assert "| Date | Row | Realised total (V) | Client flow (W) | Non-client (X) |" in out
+    assert "| 2026-09-10 | 20 | $228,000 | -$18,000 | $246,000 |" in out
+    assert "| 2026-09-05 | 15 | -$3,000 | $20,000 | -$23,000 |" in out
+    assert "Missing days" in out and "2026-09-04 (Fri)" in out
+    assert ("Weekly cross-check: 'Weekly PNL' tab week 36 (2026-09-04 to 2026-09-10) A1 Realized PNL $290,000 - matches "
+            "(difference $0); that tab's unrealised approximation for the week is $285,000, not included here.") in out
+    assert "Caveats: realised PnL only" in out and "HOLD (client commissions) is not included" in out
+    assert "Artefact" not in out and "Not yet populated" not in out
+
+
+def test_client_flow_split_shortcut_last_week_and_include_daily_false(sheet):
+    out = get_a1_client_flow_split.invoke({"start_date": "last week", "include_daily": False})
+    assert "Window: 2026-09-04 to 2026-09-10 (last week = dashboard week 36)" in out
+    assert "$290,000" in out and "| Date |" not in out
+    mtd = get_a1_client_flow_split.invoke({"start_date": "mtd"})
+    assert "Window: 2026-09-01 to 2026-09-11 (month to date)" in mtd
+    assert "Not yet populated: 2026-09-11 (after the last row)." in mtd
+    assert "Two snapshot rows on 2026-09-01 - both summed" in mtd
+
+
+def test_client_flow_split_discloses_kept_pair_mismatch_and_incomplete_rows(sheet):
+    out = get_a1_client_flow_split.invoke({"start_date": "2026-08-28", "end_date": "2026-09-03"})
+    assert "**Totals:** realised $797,000" in out
+    assert "Note: V does not equal W + X over this window (difference $60,000) - 1 row(s) lack the W/X split: row 13 (2026-09-02)." in out
+    assert "| 2026-08-30 * | 9 | $8,000,000 | $7,999,000 | $1,000 |" in out
+    assert "Artefact row 9 (2026-08-30): V $8,000,000, W $7,999,000, X $1,000 - kept - both legs in window, they net out." in out
+    assert "Artefact row 10 (2026-08-31): V -$7,990,000" in out
+    assert "The kept pair(s) net to $10,000" in out
+    assert "Weekly cross-check: 'Weekly PNL' tab week 35 (2026-08-28 to 2026-09-03) A1 Realized PNL $1,400,000 - DIFFERS (difference -$603,000)" in out
+    assert "Including the excluded" not in out
+
+
+def test_client_flow_split_excludes_lone_leg(sheet):
+    out = get_a1_client_flow_split.invoke({"start_date": "2026-08-27", "end_date": "2026-08-30"})
+    assert "**Totals:** realised $35,000 = client flow $25,000 (71.4%) + non-client flow $10,000 (28.6%) over 3 day(s)" in out
+    assert "Artefact row 9 (2026-08-30): V $8,000,000, W $7,999,000, X $1,000 - excluded - offsetting leg is outside the window." in out
+    assert "Including the excluded leg(s) the raw sums would be V $8,035,000, W $8,024,000, X $11,000." in out
+    assert "| 2026-08-30" not in out and "Weekly cross-check" not in out
+
+
+def test_client_flow_split_long_window_collapses_to_months(sheet, monkeypatch):
+    monkeypatch.setattr(st, "MAX_DAILY_ROWS", 5)
+    out = get_a1_client_flow_split.invoke({"start_date": "ytd"})
+    assert "Window: 2026-01-01 to 2026-09-11 (year to date)" in out
+    assert "| Month | Days | Realised total (V) | Client flow (W) | Non-client (X) |" in out
+    assert "| 2026-08 | 5 |" in out and "| 2026-09 | 9 |" in out          # distinct dates (09-01 has two rows)
+    assert "collapsed to monthly subtotals" in out
+    assert "YTD cross-check: the sheet's own cumulative YTD columns (S/T/U) at 2026-09-10 read total $4,087,000, client $2,643,000, non-client $1,444,000" in out
+
+
+def test_client_flow_split_single_day_empty_and_bad_input(sheet):
+    one = get_a1_client_flow_split.invoke({"start_date": "2026-09-10"})
+    assert "Window: 2026-09-10 - 1 populated day-row(s), sheet rows 20-20." in one
+    assert "**Totals:** realised $228,000 = client flow -$18,000 (-7.9%) + non-client flow $246,000 (107.9%)" in one
+    assert "one leg is negative" in one
+    empty = get_a1_client_flow_split.invoke({"start_date": "2026-10-01", "end_date": "2026-10-03"})
+    assert "No populated rows in that window; the tab covers 2026-08-27 to 2026-09-10." in empty
+    assert "Days after the last populated row: 2026-10-01 to 2026-10-03." in empty
+    bad = get_a1_client_flow_split.invoke({"start_date": "sometime"})
+    assert bad.startswith("Could not understand start_date='sometime'") and "last week" in bad
+
+
+def test_client_flow_split_unavailable_and_errors(no_sheet, monkeypatch):
+    assert get_a1_client_flow_split.invoke({"start_date": "last week"}) == UNAVAILABLE
+    s = make_sheet(session=FakeSession(status_override=403))
+    monkeypatch.setattr(st, "_get_sheet", lambda: s)
+    out = get_a1_client_flow_split.invoke({"start_date": "last week"})
+    assert out.startswith("Cannot read the A1 Metrics Dashboard sheet") and "403" in out
+
+
+def test_client_flow_split_docstring_routes_prop_flow_questions():
+    doc = " ".join(get_a1_client_flow_split.description.split())
+    for word in ("client flow", "non-client", "proprietary", "prop", "flow attribution", "REALISED", "A1 database", "last week", "mtd", "ytd"):
+        assert word in doc, word
+    assert "never read raw cells" in doc

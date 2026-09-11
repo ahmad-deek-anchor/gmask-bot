@@ -1,0 +1,112 @@
+"""Shared LLM factory: Claude via Google Vertex AI Model Garden.
+
+Usage:
+    from utils.llm import get_llm
+    llm = get_llm()                       # claude-sonnet-4-6, temperature 0, 4096 max tokens
+    llm = get_llm(temperature=0.3, max_tokens=1024, model="claude-sonnet-4-6")
+
+Authentication
+--------------
+There is NO API key. ``ChatAnthropicVertex`` authenticates with Google
+Application Default Credentials (ADC). Locally run::
+
+    gcloud auth application-default login
+    gcloud config set project anchorage-ai-development   # optional
+
+and make sure the account has the Vertex AI User role on the project. In
+GCP-hosted environments the attached service account is used automatically.
+No direct Anthropic API key or SDK client is used; auth is Google ADC only.
+
+Configuration (environment / .env, loaded once at import via python-dotenv)
+--------------------------------------------------------------------------
+    VERTEX_PROJECT   GCP project hosting the Model Garden endpoint
+                     (default: anchorage-ai-development)
+    VERTEX_LOCATION  Vertex region (default: us-east5)
+    VERTEX_MODEL     Model Garden model name (default: claude-sonnet-4-6)
+
+Instances are cached per (model, temperature, max_tokens) so repeated calls
+share one client. ``langchain_google_vertexai`` is imported lazily inside
+``get_llm`` so importing this module is cheap and does not need GCP.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+from typing import TYPE_CHECKING
+
+from dotenv import load_dotenv
+
+from utils.net import prefer_ipv4  # noqa: E402
+
+prefer_ipv4()
+
+if TYPE_CHECKING:  # pragma: no cover
+    from langchain_core.language_models.chat_models import BaseChatModel
+
+load_dotenv()
+
+DEFAULT_PROJECT = "anchorage-ai-development"
+DEFAULT_LOCATION = "us-east5"
+DEFAULT_MODEL = "claude-sonnet-4-6"
+
+_cache: dict[tuple[str, float, int], "BaseChatModel"] = {}
+_cache_lock = threading.Lock()
+
+
+def vertex_settings() -> dict[str, str]:
+    """Resolve project / location / model from the environment with defaults."""
+    return {
+        "project": os.environ.get("VERTEX_PROJECT") or DEFAULT_PROJECT,
+        "location": os.environ.get("VERTEX_LOCATION") or DEFAULT_LOCATION,
+        "model": os.environ.get("VERTEX_MODEL") or DEFAULT_MODEL,
+    }
+
+
+def get_llm(
+    temperature: float = 0.0,
+    max_tokens: int = 4096,
+    model: str | None = None,
+) -> "BaseChatModel":
+    """Return a (cached) ``ChatAnthropicVertex`` chat model.
+
+    Args:
+        temperature: Sampling temperature.
+        max_tokens: Maximum output tokens per response.
+        model: Model Garden model name; defaults to ``VERTEX_MODEL`` env or
+            ``claude-sonnet-4-6``.
+
+    Auth is Google ADC (see module docstring); no API key is read.
+    """
+    settings = vertex_settings()
+    model_name = model or settings["model"]
+    key = (model_name, float(temperature), int(max_tokens))
+
+    with _cache_lock:
+        llm = _cache.get(key)
+        if llm is not None:
+            return llm
+
+    # ADC has no default project unless gcloud config / GOOGLE_CLOUD_PROJECT set one;
+    # point it at the Vertex project so google.auth stops warning on every call.
+    os.environ.setdefault("GOOGLE_CLOUD_PROJECT", settings["project"])
+
+    # Lazy import: langchain_google_vertexai pulls in google-cloud-aiplatform.
+    from langchain_google_vertexai.model_garden import ChatAnthropicVertex
+
+    llm = ChatAnthropicVertex(
+        model_name=model_name,
+        project=settings["project"],
+        location=settings["location"],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+    with _cache_lock:
+        return _cache.setdefault(key, llm)
+
+
+def reset_llm_cache() -> None:
+    """Drop all cached LLM instances (for tests / config changes)."""
+    with _cache_lock:
+        _cache.clear()

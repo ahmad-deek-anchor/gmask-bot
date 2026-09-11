@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+.venv
+
+# Secrets / local config
+.env
+
+# Local output / state
+output/
+out/
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# OS / editors
+.DS_Store
+.vscode/

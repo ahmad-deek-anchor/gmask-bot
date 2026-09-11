@@ -1,0 +1,34 @@
+# LLM / agent stack (Claude via Vertex AI Model Garden)
+langchain>=1.0
+langchain-core>=1.0
+langgraph>=1.0
+langchain-google-vertexai>=3.0
+# langchain-google-vertexai 3.x needs anthropic 0.x; 1.x breaks ChatAnthropicVertex.invoke()
+anthropic>=0.35,<1.0
+
+# Slack bot (Bolt Socket Mode) + SQLite conversation memory
+slack_bolt>=1.20
+slack_sdk>=3.30
+aiosqlite>=0.20
+langgraph-checkpoint-sqlite>=2.0
+
+# GCP
+google-cloud-secret-manager>=2.20
+# Desk data in BigQuery (providers/bigquery.py); db-dtypes for DATE/NUMERIC -> pandas
+google-cloud-bigquery>=3.20
+db-dtypes>=1.2
+
+# Market data
+coinmetrics-api-client
+requests
+
+# Numerics
+pandas
+numpy
+
+# App
+python-dotenv
+rich
+
+# Dev
+pytest

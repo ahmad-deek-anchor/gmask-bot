@@ -1,0 +1,15 @@
+# systemd --user oneshot: daily z-score signals report posted to Slack.
+# Triggered by trading-signals-daily.timer. Not enabled by default.
+[Unit]
+Description=Trading signals daily report -> Slack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ahmaddeek/program/signals-main
+ExecStart=/home/ahmaddeek/program/signals-main/.venv/bin/python run_signals.py --days 45 --post-slack
+Environment=PYTHONUNBUFFERED=1
+# Optional: SLACK_CHANNEL_ID=C... (else secret trading_signals_slack_channel_id; skips with a warning if neither)
+# EnvironmentFile=-%h/program/signals-main/.env
+TimeoutStartSec=30min

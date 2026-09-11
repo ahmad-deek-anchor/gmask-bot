@@ -1,0 +1,22 @@
+# systemd --user unit: trading-signals Slack bot (Bolt Socket Mode) from the local venv.
+# Install: see deploy/cloud-run.md section 5. Not enabled by default.
+# Stop ~/slackbot/bot.py before starting this - one Socket Mode listener per app token.
+[Unit]
+Description=Trading signals Slack bot (Socket Mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ahmaddeek/program/signals-main
+ExecStart=/home/ahmaddeek/program/signals-main/.venv/bin/python slack_bot.py -v
+Environment=PYTHONUNBUFFERED=1
+Environment=SLACK_BOT_DB=/home/ahmaddeek/program/signals-main/data/slack_bot.db
+# Optional overrides (otherwise Secret Manager via ADC): SLACK_BOT_TOKEN, SLACK_APP_TOKEN
+# EnvironmentFile=-%h/program/signals-main/.env
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,33 @@
+[project]
+name = "tradingsignals"
+version = "0.2.0"
+description = "Z-score anomaly signals on crypto spot (Coin Metrics) and derivatives (Amberdata) data, with Claude-on-Vertex analysis, a terminal chat agent and a Slack bot."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain>=1.0",
+    "langchain-core>=1.0",
+    "langgraph>=1.0",
+    "langchain-google-vertexai>=3.0",
+    "anthropic>=0.35,<1.0",
+    "slack_bolt>=1.20",
+    "slack_sdk>=3.30",
+    "aiosqlite>=0.20",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "google-cloud-secret-manager>=2.20",
+    "google-cloud-bigquery>=3.20",
+    "db-dtypes>=1.2",
+    "coinmetrics-api-client",
+    "requests",
+    "pandas",
+    "numpy",
+    "python-dotenv",
+    "rich",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,12 @@
+# Fires trading-signals-daily.service at 07:00 America/New_York every day.
+# Install: systemctl --user enable --now trading-signals-daily.timer  (see deploy/cloud-run.md)
+[Unit]
+Description=Daily trading signals post (07:00 New York)
+
+[Timer]
+OnCalendar=*-*-* 07:00:00 America/New_York
+Persistent=true
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

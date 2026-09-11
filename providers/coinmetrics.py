@@ -1,0 +1,224 @@
+"""Coin Metrics implementation of MarketDataProvider (spot data).
+
+Only the spot methods are used in production (derivatives come from Amberdata
+via CompositeProvider), but the derivative methods are kept functional so the
+provider is complete on its own.
+
+Spot price resolution order
+---------------------------
+1. asset metric PriceUSD              (not offered for several small-cap assets)
+2. daily candle price_close from the token's spot markets (works for all)
+3. asset metric ReferenceRateUSD      (trial key returns 403; treated as no data)
+"""
+
+import logging
+from datetime import datetime
+from typing import Optional
+
+import pandas as pd
+
+from providers.base import MarketDataProvider
+
+logger = logging.getLogger(__name__)
+
+# Asset IDs that differ between our token symbols and Coin Metrics IDs.
+# Polygon is listed as "pol" since the rebrand (the old "matic" markets are dead);
+# Sky is "sky_sky" ("sky" is Skycoin, "mkr" the legacy Maker token).
+ASSET_MAP = {
+    "sky": "sky_sky",
+}
+
+# Per-token spot markets to try, in order, as (exchange, quote)
+EXCHANGE_AVAILABILITY = {
+    "hype":    [("coinbase", "usd"), ("kraken", "usd"), ("bybit", "usdt"), ("okex", "usdt")],
+    "syrup":   [("coinbase", "usd"), ("binance", "usdt"), ("kraken", "usd")],
+    "fluid":   [("coinbase", "usd"), ("bybit", "usdt")],
+    "aero":    [("coinbase", "usd"), ("kraken", "usd"), ("bybit", "usdt")],
+    "spx":     [("coinbase", "usd"), ("binance", "usdt"), ("kraken", "usd"), ("okex", "usdt")],
+    "ray":     [("coinbase", "usd"), ("kraken", "usd"), ("bybit", "usdt")],
+    "pendle":  [("coinbase", "usd"), ("binance", "usdt"), ("kraken", "usd"), ("bybit", "usdt")],
+    "morpho":  [("coinbase", "usd"), ("kraken", "usd"), ("bybit", "usdt")],
+}
+DEFAULT_EXCHANGES = [
+    ("coinbase", "usd"),
+    ("binance", "usdt"),
+    ("kraken", "usd"),
+    ("bybit", "usdt"),
+]
+
+TOKENS_WITHOUT_LIQUIDATIONS = {"fluid", "morpho", "pendle", "pump"}
+
+
+def asset_id_for(token: str) -> str:
+    """Map a token symbol to its Coin Metrics asset id."""
+    return ASSET_MAP.get(token.lower(), token.lower())
+
+
+def spot_markets_for(token: str) -> list[str]:
+    """Candidate Coin Metrics spot market ids for a token, in preference order."""
+    asset_id = asset_id_for(token)
+    return [f"{ex}-{asset_id}-{quote}-spot" for ex, quote in EXCHANGE_AVAILABILITY.get(token.lower(), DEFAULT_EXCHANGES)]
+
+
+def _normalize_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce `time` to tz-naive UTC daily datetime64[ns], sorted ascending."""
+    df = df.copy()
+    df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None).dt.normalize()
+    return df.sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
+
+
+class CoinMetricsProvider(MarketDataProvider):
+
+    def __init__(self, client):
+        self._client = client
+
+    # ------------------------------------------------------------------
+    # Internal fetch helpers
+    # ------------------------------------------------------------------
+
+    def _asset_metric(self, token: str, metric: str, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
+        """One daily asset metric as (time, <metric>) or None on any failure / empty."""
+        try:
+            df = self._client.get_asset_metrics(
+                assets=[asset_id_for(token)], metrics=[metric],
+                start_time=start_date.strftime("%Y-%m-%d"), end_time=end_date.strftime("%Y-%m-%d"),
+                frequency="1d",
+            ).to_dataframe()
+        except Exception as e:
+            logger.debug(f"CoinMetrics {metric} failed for {token}: {type(e).__name__}: {e}")
+            return None
+        if df is None or df.empty or metric not in df.columns:
+            return None
+        df = df[["time", metric]].copy()
+        df[metric] = pd.to_numeric(df[metric], errors="coerce")
+        return _normalize_time(df)
+
+    def _market_candles(self, market: str, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
+        """Daily candles for one market, time-normalised; None on error / empty."""
+        sd, ed = start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+        try:
+            df = self._client.get_market_candles(
+                markets=[market], start_time=sd, end_time=ed, frequency="1d", page_size=1000
+            ).to_dataframe()
+        except Exception as e:
+            logger.debug(f"CoinMetrics candles failed for {market}: {type(e).__name__}: {e}")
+            return None
+        if df is None or df.empty:
+            return None
+        return _normalize_time(df)
+
+    def _candles(self, token: str, start_date: datetime, end_date: datetime) -> list[pd.DataFrame]:
+        """Daily candles from every spot market of the token that returns data (preference order)."""
+        frames = []
+        for market in spot_markets_for(token):
+            df = self._market_candles(market, start_date, end_date)
+            if df is not None:
+                frames.append(df)
+        return frames
+
+    # ------------------------------------------------------------------
+    # Spot price / OHLCV
+    # ------------------------------------------------------------------
+
+    def get_spot_ohlcv(
+        self, token: str, start_date: datetime, end_date: datetime
+    ) -> Optional[pd.DataFrame]:
+        """OHLC from the token's primary spot market; spot_volume (USD) summed over
+        every market in the token's exchange list that returned candles."""
+        frames = self._candles(token, start_date, end_date)
+        if not frames:
+            return None
+        rename = {
+            "price_open": "open", "price_high": "high", "price_low": "low", "price_close": "close",
+            "candle_usd_volume": "spot_volume",
+        }
+        frames = [f.rename(columns=rename) for f in frames]
+        cols = ["time", "open", "high", "low", "close", "spot_volume"]
+        primary = frames[0]
+        if not all(c in primary.columns for c in cols):
+            return None
+        df = primary[cols].copy()
+        for c in cols[1:]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+
+        # Sum USD volume across all markets that returned data (NaN if none did on a day).
+        vols = [
+            pd.to_numeric(f.set_index("time")["spot_volume"], errors="coerce").astype("float64")
+            for f in frames if "spot_volume" in f.columns
+        ]
+        if vols:
+            total = pd.concat(vols, axis=1).sum(axis=1, min_count=1)
+            df = df.merge(total.rename("spot_volume").reset_index(), on="time", how="outer", suffixes=("_primary", ""))
+            df = df.drop(columns=["spot_volume_primary"]).sort_values("time").reset_index(drop=True)
+        logger.info("CoinMetrics: %s spot volume summed over %d market(s)", token, len(vols))
+        return df[cols]
+
+    def get_spot_price(
+        self, token: str, start_date: datetime, end_date: datetime
+    ) -> Optional[pd.DataFrame]:
+        # 1. PriceUSD asset metric
+        df = self._asset_metric(token, "PriceUSD", start_date, end_date)
+        if df is not None:
+            return df.rename(columns={"PriceUSD": "price"})
+
+        # 2. candle close from the token's spot markets
+        candles = self.get_spot_ohlcv(token, start_date, end_date)
+        if candles is not None and candles["close"].notna().any():
+            return candles[["time", "close"]].rename(columns={"close": "price"}).reset_index(drop=True)
+
+        # 3. ReferenceRateUSD (403 on the trial key -> _asset_metric returns None; no retry)
+        df = self._asset_metric(token, "ReferenceRateUSD", start_date, end_date)
+        if df is not None:
+            return df.rename(columns={"ReferenceRateUSD": "price"})
+
+        logger.debug(f"CoinMetrics: no spot price for {token}")
+        return None
+
+    # ------------------------------------------------------------------
+    # Derivatives (unused when composed with Amberdata; kept for completeness)
+    # ------------------------------------------------------------------
+
+    def get_funding_rate(
+        self, token: str, start_date: datetime, end_date: datetime
+    ) -> Optional[pd.DataFrame]:
+        metric = "futures_aggregate_funding_rate_usd_margin_1y_period"
+        df = self._asset_metric(token, metric, start_date, end_date)
+        return None if df is None else df.rename(columns={metric: "funding_rate"})
+
+    def get_perp_oi(
+        self, token: str, start_date: datetime, end_date: datetime
+    ) -> Optional[pd.DataFrame]:
+        metric = "open_interest_reported_future_perpetual_usd"
+        df = self._asset_metric(token, metric, start_date, end_date)
+        return None if df is None else df.rename(columns={metric: "perp_oi"})
+
+    def get_perp_volume(
+        self, token: str, start_date: datetime, end_date: datetime
+    ) -> Optional[pd.DataFrame]:
+        metric = "volume_reported_future_perpetual_usd_1d"
+        df = self._asset_metric(token, metric, start_date, end_date)
+        return None if df is None else df.rename(columns={metric: "perp_volume"})
+
+    def get_liquidations(
+        self, token: str, start_date: datetime, end_date: datetime
+    ) -> Optional[pd.DataFrame]:
+        if token.lower() in TOKENS_WITHOUT_LIQUIDATIONS:
+            return None
+        pair = f"{asset_id_for(token)}-usd"
+        buy, sell = "liquidations_reported_future_buy_usd_1d", "liquidations_reported_future_sell_usd_1d"
+        try:
+            df = self._client.get_pair_metrics(
+                pairs=[pair], metrics=[buy, sell],
+                start_time=start_date.strftime("%Y-%m-%d"), end_time=end_date.strftime("%Y-%m-%d"),
+                frequency="1d",
+            ).to_dataframe()
+        except Exception as e:
+            logger.debug(f"CoinMetrics liquidations failed for {token}: {e}")
+            return None
+        if df is None or df.empty or buy not in df.columns or sell not in df.columns:
+            return None
+        df = df.rename(columns={buy: "long_liquidations", sell: "short_liquidations"})
+        for c in ("long_liquidations", "short_liquidations"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["total_liquidations"] = df["long_liquidations"].fillna(0) + df["short_liquidations"].fillna(0)
+        return _normalize_time(df[["time", "long_liquidations", "short_liquidations", "total_liquidations"]])

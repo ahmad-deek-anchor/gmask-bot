@@ -1,0 +1,193 @@
+"""Shared HTTP plumbing for the Amberdata providers.
+
+Both ``providers.amberdata`` (perp analytics) and ``providers.amberdata_options``
+(options analytics) talk to ``api.amberdata.com`` with the same conventions:
+
+* ``x-api-key`` header; ``Accept-Encoding: gzip`` (the options endpoints reject
+  uncompressed requests with HTTP 400 "Compression required").
+* Retry with exponential backoff on 429 / 5xx (honouring ``Retry-After``).
+* Responses wrap rows in ``payload.data`` with an optional cursor URL in
+  ``payload.metadata.next``.
+* ``startDate`` inclusive, ``endDate`` exclusive; timestamps arrive as epoch
+  milliseconds on some endpoints and ISO-8601 strings on others.
+
+This module hosts the pieces that are identical for both providers so neither
+copies the other.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Optional
+
+import pandas as pd
+import requests
+
+logger = logging.getLogger(__name__)
+
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+AUTH_STATUSES = {401, 403}
+DEFAULT_MAX_PAGES = 50
+
+
+def day_str(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+
+def to_utc_day(values: pd.Series) -> pd.Series:
+    """Parse Amberdata timestamps (ms ints or ISO strings) into tz-naive UTC days."""
+    if pd.api.types.is_numeric_dtype(values):
+        ts = pd.to_datetime(values.astype("int64"), unit="ms", utc=True)
+    else:
+        try:
+            ts = pd.to_datetime(values, utc=True, format="ISO8601")
+        except (ValueError, TypeError):
+            ts = pd.to_datetime(values, utc=True)
+    return ts.dt.tz_convert(None).dt.floor("D")
+
+
+def to_utc_timestamp(values: pd.Series) -> pd.Series:
+    """Parse Amberdata timestamps (ms ints or ISO strings) into tz-naive UTC datetimes."""
+    if pd.api.types.is_numeric_dtype(values):
+        ts = pd.to_datetime(values.astype("int64"), unit="ms", utc=True)
+    else:
+        try:
+            ts = pd.to_datetime(values, utc=True, format="ISO8601")
+        except (ValueError, TypeError):
+            ts = pd.to_datetime(values, utc=True)
+    return ts.dt.tz_convert(None)
+
+
+def date_chunks(start: datetime, end: datetime, max_days: int) -> list[tuple[datetime, datetime]]:
+    """Split [start, end] (inclusive days) into (startDate, endDate-exclusive) windows."""
+    start_day = datetime(start.year, start.month, start.day)
+    end_excl = datetime(end.year, end.month, end.day) + timedelta(days=1)
+    chunks = []
+    cur = start_day
+    while cur < end_excl:
+        nxt = min(cur + timedelta(days=max_days), end_excl)
+        chunks.append((cur, nxt))
+        cur = nxt
+    return chunks
+
+
+class AmberdataHTTP:
+    """Authenticated session with retry/backoff and cursor pagination.
+
+    ``last_status`` / ``last_error`` describe the most recent failed request
+    (reset to ``None`` / ``""`` on success) so callers can react to specific
+    4xx replies, e.g. the "range over the maximum allowed" 400.
+    ``call_count`` counts every HTTP request issued (including retries and
+    cursor pages) for cost accounting.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        session: Optional[requests.Session] = None,
+        timeout: int = 30,
+        max_retries: int = 3,
+        backoff: float = 1.0,
+    ):
+        self.session = session or requests.Session()
+        self.session.headers.update({
+            "x-api-key": api_key,
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+        })
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.backoff = backoff
+        self.call_count = 0
+        self.last_status: Optional[int] = None
+        self.last_error: str = ""
+
+    # ------------------------------------------------------------------
+
+    def request(self, url: str, params: Optional[dict]) -> Optional[dict]:
+        """GET with retry/backoff on 429/5xx. Returns parsed JSON or None."""
+        attempt = 0
+        while True:
+            self.call_count += 1
+            try:
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+            except requests.RequestException as e:
+                if attempt >= self.max_retries:
+                    logger.warning("Amberdata request failed %s: %s", url, e)
+                    self.last_status, self.last_error = None, str(e)
+                    return None
+                attempt += 1
+                time.sleep(self.backoff * (2 ** (attempt - 1)))
+                continue
+
+            status = resp.status_code
+            if status == 200:
+                try:
+                    data = resp.json()
+                except ValueError as e:
+                    logger.warning("Amberdata non-JSON response %s: %s", url, e)
+                    self.last_status, self.last_error = status, "non-JSON response"
+                    return None
+                self.last_status, self.last_error = None, ""
+                return data
+            if status in RETRY_STATUSES and attempt < self.max_retries:
+                attempt += 1
+                delay = self.backoff * (2 ** (attempt - 1))
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = max(delay, float(retry_after))
+                    except ValueError:
+                        pass
+                logger.info("Amberdata HTTP %s on %s — retry %d/%d in %.1fs",
+                            status, url, attempt, self.max_retries, delay)
+                time.sleep(delay)
+                continue
+
+            body = resp.text[:300] if resp.text else ""
+            self.last_status, self.last_error = status, _error_message(resp, body)
+            if status in AUTH_STATUSES:
+                logger.warning("Amberdata HTTP %s (auth/tier) on %s params=%s: %s",
+                               status, url, params, body)
+            elif status == 404:
+                logger.info("Amberdata HTTP 404 on %s params=%s", url, params)
+            else:
+                logger.warning("Amberdata HTTP %s on %s params=%s: %s", status, url, params, body)
+            return None
+
+    def get_rows(self, url: str, params: dict, max_pages: int = DEFAULT_MAX_PAGES) -> Optional[list]:
+        """Fetch ``payload.data`` for an analytics endpoint, following cursors.
+
+        Returns a list of row dicts (possibly empty) or None on error.
+        """
+        rows: list = []
+        page_params: Optional[dict] = dict(params)
+        for _ in range(max_pages):
+            data = self.request(url, page_params)
+            if data is None:
+                return None if not rows else rows
+            payload = data.get("payload") if isinstance(data, dict) else None
+            if isinstance(payload, dict):
+                page = payload.get("data") or []
+                nxt = (payload.get("metadata") or {}).get("next")
+            elif isinstance(payload, list):
+                page, nxt = payload, None
+            else:
+                page, nxt = [], None
+            rows.extend(r for r in page if isinstance(r, dict))
+            if not nxt:
+                break
+            url, page_params = nxt, None  # cursor URL is fully qualified
+        return rows
+
+
+def _error_message(resp, body: str) -> str:
+    try:
+        j = resp.json()
+        if isinstance(j, dict):
+            return str(j.get("message") or j.get("description") or body)
+    except ValueError:
+        pass
+    return body

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import pytest
@@ -894,3 +895,366 @@ def test_slack_prompt_mentions_memory_rules():
 
     p = slack_bot.load_slack_prompt(today=date(2026, 9, 10))
     assert "Memory in Slack" in p and "set_channel_rule" in p and "remember" in p
+
+
+# ----------------------------------------------------------------------------
+# Resilience (2026-09-11 incident): nothing blocking on the loop, in-flight tracking,
+# graceful shutdown, watchdogs. No network.
+# ----------------------------------------------------------------------------
+
+import threading  # noqa: E402
+import time  # noqa: E402
+
+from slack_bot import (  # noqa: E402
+    ACTIVE_REQUESTS,
+    RESTART_TEXT,
+    STATE,
+    InflightStore,
+    loop_lag_watchdog,
+    shutdown,
+    sweep_inflight,
+    warm_memory_store,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_inflight(tmp_path, monkeypatch):
+    """Every test gets its own inflight file; nothing is written under data/."""
+    store = InflightStore(path=str(tmp_path / "inflight.json"))
+    monkeypatch.setattr(slack_bot, "_INFLIGHT", store)
+    ACTIVE_REQUESTS.clear()
+    STATE.accepting = True
+    STATE.stop_signal = None
+    return store
+
+
+def test_memory_store_initialised_off_the_loop_thread(monkeypatch, caplog):
+    """warm_memory_store() must resolve the store (and its embeddings probe) in a worker thread."""
+    seen = {}
+
+    class FakeStore:
+        def warm(self):
+            seen["warm_thread"] = threading.current_thread()
+            return True
+
+    def fake_factory():
+        seen["factory_thread"] = threading.current_thread()
+        return FakeStore()
+
+    monkeypatch.setattr(slack_bot, "_memory_store", fake_factory)
+
+    async def main():
+        loop_thread = threading.current_thread()
+        with caplog.at_level(logging.INFO, logger="slack_bot"):
+            assert await warm_memory_store() is True
+        return loop_thread
+
+    loop_thread = asyncio.run(main())
+    assert seen["factory_thread"] is not loop_thread
+    assert seen["warm_thread"] is not loop_thread
+    assert any("memory store ready" in r.getMessage() and "embeddings: on" in r.getMessage() for r in caplog.records)
+
+
+def test_warm_memory_store_failure_is_logged_not_raised(monkeypatch, caplog):
+    def boom():
+        raise RuntimeError("no ADC")
+
+    monkeypatch.setattr(slack_bot, "_memory_store", boom)
+    with caplog.at_level(logging.WARNING, logger="slack_bot"):
+        assert asyncio.run(warm_memory_store()) is False
+    assert any("warm-up failed" in r.getMessage() for r in caplog.records)
+
+
+def test_answer_resolves_memory_store_inside_worker_thread(monkeypatch):
+    """The incident: `_memory_store()` evaluated on the loop before to_thread. Now it runs in the thread."""
+    seen = {}
+
+    def fake_factory():
+        seen["thread"] = threading.current_thread()
+        from providers.factory import get_memory_store
+        return get_memory_store()
+
+    monkeypatch.setattr(slack_bot, "_memory_store", fake_factory)
+
+    async def main():
+        await answer(FakeAgent("fine"), "T1", "U1", "hello", channel_id="C1")
+        return threading.current_thread()
+
+    loop_thread = asyncio.run(main())
+    assert seen["thread"] is not loop_thread
+
+
+def test_inflight_added_on_placeholder_removed_on_success(_isolated_inflight):
+    seen = {}
+
+    class Snooping(RecordingClient):
+        async def chat_update(self, **kwargs):
+            seen["during"] = [e["ts"] for e in _isolated_inflight.all()]
+            return await super().chat_update(**kwargs)
+
+    client = Snooping()
+    asyncio.run(handle(_mention(), client, FakeAgent("done")))
+    assert seen["during"] == ["1001.000000"]  # tracked while the request is running
+    assert _isolated_inflight.all() == []  # gone once the final chat_update succeeded
+    assert json.loads(_isolated_inflight.path.read_text()) == {}
+
+
+def test_inflight_entry_shape_and_persistence(tmp_path):
+    clock = _Clock(5000.0)
+    store = InflightStore(path=str(tmp_path / "i.json"), now=clock)
+    store.add("C1", "1.5", "U9", thread_ts="1.0")
+    again = InflightStore(path=str(tmp_path / "i.json"), now=clock)
+    assert again.all() == [{"channel": "C1", "ts": "1.5", "user": "U9", "thread_ts": "1.0", "started": 5000.0}]
+    again.remove("C1", "1.5")
+    assert again.all() == [] and InflightStore(path=str(tmp_path / "i.json")).all() == []
+    mem = InflightStore(path=str(tmp_path / "never.json"), persist=False)
+    mem.add("C1", "2", "U1")
+    assert not (tmp_path / "never.json").exists()
+
+
+def test_inflight_kept_when_chat_update_fails(_isolated_inflight):
+    class Broken(RecordingClient):
+        async def chat_update(self, **kwargs):
+            raise RuntimeError("message_not_found")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(handle(_mention(), Broken(), FakeAgent("done")))
+    assert [e["ts"] for e in _isolated_inflight.all()] == ["1001.000000"]  # the sweep / shutdown will handle it
+
+
+def test_startup_sweep_updates_leftovers_and_drops_stale(tmp_path, caplog):
+    clock = _Clock(1_000_000.0)
+    store = InflightStore(path=str(tmp_path / "i.json"), now=clock)
+    store.add("D1", "10.1", "U1")
+    clock.t += 3600  # an hour later: still fresh
+    store.add("C2", "20.2", "U2", thread_ts="20.0")
+    store.entries["C3:old"] = {"channel": "C3", "ts": "old", "user": "U3", "thread_ts": None,
+                               "started": clock.t - 25 * 3600}  # 25 h old: drop, do not update
+    store._save()
+
+    client = RecordingClient()
+    with caplog.at_level(logging.INFO, logger="slack_bot"):
+        updated, dropped = asyncio.run(sweep_inflight(client, InflightStore(path=str(tmp_path / "i.json"), now=clock)))
+    assert (updated, dropped) == (2, 1)
+    assert sorted((u["channel"], u["ts"], u["text"]) for u in client.updates) == [
+        ("C2", "20.2", RESTART_TEXT), ("D1", "10.1", RESTART_TEXT)]
+    assert json.loads((tmp_path / "i.json").read_text()) == {}
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("2 dangling placeholder(s) from before the restart updated, 1 stale dropped" in m for m in msgs)
+    assert any("dropping stale placeholder C3:old" in m for m in msgs)
+
+
+def test_startup_sweep_survives_slack_errors(tmp_path, caplog):
+    store = InflightStore(path=str(tmp_path / "i.json"))
+    store.add("D1", "10.1", "U1")
+
+    class Broken(RecordingClient):
+        async def chat_update(self, **kwargs):
+            raise RuntimeError("channel_not_found")
+
+    with caplog.at_level(logging.WARNING, logger="slack_bot"):
+        assert asyncio.run(sweep_inflight(Broken(), store)) == (0, 0)
+    assert store.all() == []  # dropped anyway; never retried forever
+    assert any("could not update placeholder D1:10.1" in r.getMessage() for r in caplog.records)
+
+
+def test_shutdown_waits_for_fast_requests_then_warns_the_rest(_isolated_inflight, caplog):
+    client = RecordingClient()
+
+    class Fast(FakeAgent):
+        async def ainvoke(self, inp, config):
+            await asyncio.sleep(0.15)  # still running when the stop arrives; done within the grace period
+            return await super().ainvoke(inp, config)
+
+    fast = Fast("quick answer")
+
+    class Hanging(FakeAgent):
+        async def ainvoke(self, inp, config):
+            await asyncio.sleep(30)
+
+    async def main():
+        t_fast = asyncio.create_task(handle(_mention(ts="1.1", user="UA"), client, fast))
+        t_slow = asyncio.create_task(handle(_mention(ts="2.2", user="UB", channel="C9"), client, Hanging()))
+        await asyncio.sleep(0.05)  # both placeholders posted
+        assert len(_isolated_inflight) == 2 and {t_fast, t_slow} <= ACTIVE_REQUESTS
+        with caplog.at_level(logging.INFO, logger="slack_bot"):
+            n = await shutdown(client, grace_s=0.5)
+        assert t_fast.done() and t_slow.cancelled()
+        return n
+
+    assert asyncio.run(main()) == 1
+    assert STATE.accepting is False
+    finals = {(u["channel"], u["text"]) for u in client.updates}
+    assert ("C1", "quick answer") in finals  # finished within the grace period
+    assert ("C9", RESTART_TEXT) in finals  # cancelled and marked
+    assert _isolated_inflight.all() == [] and ACTIVE_REQUESTS == set()
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("waiting up to 0s for 2 in-flight" in m or "waiting up to 1s for 2 in-flight" in m for m in msgs)
+    assert any("1 request(s) did not finish" in m for m in msgs)
+    assert any("1 placeholder(s) marked as interrupted" in m for m in msgs)
+
+
+def test_shutdown_with_nothing_in_flight(caplog):
+    client = RecordingClient()
+    with caplog.at_level(logging.INFO, logger="slack_bot"):
+        assert asyncio.run(shutdown(client, grace_s=0.1)) == 0
+    assert client.updates == [] and STATE.accepting is False
+
+
+def test_dispatch_refuses_events_while_shutting_down():
+    """build_app's listeners post a busy notice instead of running the agent once a stop signal arrived."""
+    import inspect
+
+    class FakeApp:
+        def __init__(self, token):
+            self.client = RecordingClient()
+            self.handlers = {}
+
+        def event(self, name):
+            def deco(fn):
+                self.handlers[name] = fn
+                return fn
+            return deco
+
+    import slack_bolt.async_app as bolt_async
+    real = bolt_async.AsyncApp
+    bolt_async.AsyncApp = FakeApp
+    try:
+        app = slack_bot.build_app(FakeAgent("should not run"), "xoxb-test")
+    finally:
+        bolt_async.AsyncApp = real
+    assert inspect.iscoroutinefunction(app.handlers["app_mention"])
+    STATE.accepting = False
+    client = RecordingClient()
+    asyncio.run(app.handlers["app_mention"](_mention(thread_ts="5.5"), client))
+    assert client.posts == [{"channel": "C1", "text": slack_bot.BUSY_TEXT, "thread_ts": "5.5"}]
+    assert client.updates == []
+
+
+def test_loop_lag_watchdog_logs_on_stall(caplog):
+    async def main():
+        task = asyncio.create_task(loop_lag_watchdog(interval=0.05, threshold=0.1))
+        await asyncio.sleep(0.01)  # the watchdog is asleep, expecting to wake in 50 ms
+        time.sleep(0.4)  # block the event loop (this is what the incident looked like)
+        await asyncio.sleep(0.1)  # let the late wake-up run
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    with caplog.at_level(logging.WARNING, logger="slack_bot"):
+        asyncio.run(main())
+    stalls = [r.getMessage() for r in caplog.records if "event loop stalled for" in r.getMessage()]
+    assert stalls, caplog.records
+    secs = float(stalls[0].split("stalled for ")[1].split(" s")[0])
+    assert 0.25 <= secs < 2.0
+
+
+def test_loop_lag_watchdog_quiet_when_loop_is_free(caplog):
+    async def main():
+        task = asyncio.create_task(loop_lag_watchdog(interval=0.02, threshold=0.1))
+        await asyncio.sleep(0.15)
+        task.cancel()
+
+    with caplog.at_level(logging.WARNING, logger="slack_bot"):
+        asyncio.run(main())
+    assert not [r for r in caplog.records if "stalled" in r.getMessage()]
+
+
+def test_failsafe_fires_when_chat_update_hangs(_isolated_inflight, caplog):
+    """Primary path wedged inside chat_update -> the failsafe posts TIMEOUT_TEXT via a fresh client."""
+    class HangingUpdate(RecordingClient):
+        async def chat_update(self, **kwargs):
+            await asyncio.sleep(3600)
+
+    fallback = RecordingClient()
+    client = HangingUpdate()
+
+    async def main():
+        task = asyncio.create_task(handle(_mention(), client, FakeAgent("answer"), timeout=0.05,
+                                          failsafe_extra=0.2, fallback_client_factory=lambda: fallback))
+        with caplog.at_level(logging.ERROR, logger="slack_bot"):
+            await asyncio.wait({task}, timeout=2.0)
+        assert task.done() and task.cancelled()
+
+    asyncio.run(main())
+    assert fallback.updates == [{"channel": "C1", "ts": "1001.000000", "text": TIMEOUT_TEXT}]
+    assert client.updates == []  # the primary never completed
+    assert _isolated_inflight.all() == [] and ACTIVE_REQUESTS == set()
+    errs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("failsafe: request channel=C1 ts=1001.000000 still running" in m for m in errs)
+    assert any("Stuck task stack" in m and "chat_update" in m for m in errs)  # the stack names the wedged await
+
+
+def test_failsafe_does_not_fire_on_a_normal_request(_isolated_inflight):
+    fallback = RecordingClient()
+    client = RecordingClient()
+    asyncio.run(handle(_mention(), client, FakeAgent("fine"), timeout=1, failsafe_extra=0.05,
+                       fallback_client_factory=lambda: fallback))
+    assert client.updates[0]["text"] == "fine" and fallback.updates == []
+
+
+def test_failsafe_fallback_failure_is_logged(_isolated_inflight, caplog):
+    class HangingUpdate(RecordingClient):
+        async def chat_update(self, **kwargs):
+            await asyncio.sleep(3600)
+
+    def broken_factory():
+        raise RuntimeError("no token")
+
+    async def main():
+        task = asyncio.create_task(handle(_mention(), HangingUpdate(), FakeAgent("x"), timeout=0.05,
+                                          failsafe_extra=0.1, fallback_client_factory=broken_factory))
+        with caplog.at_level(logging.ERROR, logger="slack_bot"):
+            await asyncio.wait({task}, timeout=2.0)
+        assert task.cancelled()
+
+    asyncio.run(main())
+    assert any("fallback chat_update failed" in r.getMessage() for r in caplog.records)
+    assert [e["ts"] for e in _isolated_inflight.all()] == ["1001.000000"]  # left for the next start-up sweep
+
+
+def test_request_stop_sets_state_once(caplog):
+    import signal
+
+    async def main():
+        stop = asyncio.Event()
+        with caplog.at_level(logging.INFO, logger="slack_bot"):
+            slack_bot._request_stop(stop, signal.SIGTERM)
+            slack_bot._request_stop(stop, signal.SIGINT)
+        return stop.is_set()
+
+    assert asyncio.run(main()) is True
+    assert STATE.accepting is False and STATE.stop_signal == "SIGTERM"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("received SIGTERM" in m for m in msgs)
+    assert any("already shutting down" in m for m in msgs)
+
+
+def test_handle_logs_wall_time(caplog):
+    with caplog.at_level(logging.INFO, logger="slack_bot"):
+        asyncio.run(handle(_mention(), RecordingClient(), FakeAgent("ok")))
+    assert any(r.getMessage().startswith("replied ") and " in " in r.getMessage() and r.getMessage().rstrip().endswith("s")
+               for r in caplog.records)
+
+
+def test_selftest_uses_in_memory_inflight(monkeypatch, tmp_path):
+    """run_selftest never writes the live inflight file and warms the store first."""
+    order = []
+
+    async def fake_warm():
+        order.append("warm")
+        return True
+
+    @slack_bot.asynccontextmanager
+    async def fake_agent(*a, **k):
+        order.append("agent")
+        yield FakeAgent("selftest reply")
+
+    monkeypatch.setattr(slack_bot, "warm_memory_store", fake_warm)
+    monkeypatch.setattr(slack_bot, "build_agent", fake_agent)
+    live = tmp_path / "live_inflight.json"
+    monkeypatch.setenv("SLACK_INFLIGHT_FILE", str(live))
+    monkeypatch.setattr(slack_bot, "_INFLIGHT", None)
+    assert asyncio.run(slack_bot.run_selftest("q")) == 0
+    assert order == ["agent", "warm"]
+    assert not live.exists()

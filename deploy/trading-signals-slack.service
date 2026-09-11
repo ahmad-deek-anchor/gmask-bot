@@ -16,6 +16,11 @@ Environment=SLACK_BOT_DB=/home/ahmaddeek/program/signals-main/data/slack_bot.db
 # EnvironmentFile=-%h/program/signals-main/.env
 Restart=always
 RestartSec=10
+# Graceful stop: SIGTERM lets the bot finish in-flight requests (SLACK_SHUTDOWN_GRACE_S,
+# default 20 s) and mark any leftover ":hourglass: Working on it" placeholders before it
+# exits 0; systemd escalates to SIGKILL only after TimeoutStopSec.
+KillSignal=SIGTERM
+KillMode=mixed
 TimeoutStopSec=30
 
 [Install]

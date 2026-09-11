@@ -37,7 +37,25 @@ def test_defaults(fake_vertex):
         "location": "us-east5",
         "temperature": 0.0,
         "max_tokens": 4096,
+        "timeout": 120.0,      # LLM_TIMEOUT_S default; anthropic's own default is 10 minutes
+        "max_retries": 2,      # langchain attempt count: LLM_MAX_RETRIES (1) + the first try
     }
+
+
+def test_timeout_and_retries_from_env(monkeypatch, fake_vertex):
+    monkeypatch.setenv("LLM_TIMEOUT_S", "45")
+    monkeypatch.setenv("LLM_MAX_RETRIES", "0")
+    llm = llm_mod.get_llm()
+    assert llm.kwargs["timeout"] == 45.0
+    assert llm.kwargs["max_retries"] == 1  # zero retries = one attempt
+
+
+def test_timeout_and_retries_ignore_garbage(monkeypatch, fake_vertex):
+    monkeypatch.setenv("LLM_TIMEOUT_S", "soon")
+    monkeypatch.setenv("LLM_MAX_RETRIES", "-3")
+    llm = llm_mod.get_llm()
+    assert llm.kwargs["timeout"] == 120.0
+    assert llm.kwargs["max_retries"] == 2
 
 
 def test_env_overrides(monkeypatch, fake_vertex):
@@ -92,3 +110,5 @@ def test_real_class_accepts_kwargs_offline():
     assert llm.model_name == "claude-sonnet-4-6"
     assert llm.temperature == 0.2
     assert llm.max_output_tokens == 33
+    assert llm.timeout == 120.0
+    assert llm.max_retries == 2

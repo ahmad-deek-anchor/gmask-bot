@@ -4,6 +4,7 @@ No network, no Vertex: HashEmbedder (deterministic) or keyword fallback, SQLite 
 from __future__ import annotations
 
 import threading
+import time
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -300,6 +301,7 @@ def test_default_embedder_off(monkeypatch):
 
 
 def test_vertex_embedder_degrades_without_network(monkeypatch, caplog):
+    """Client construction failing (no ADC) -> keyword search per call; the breaker opens after 3."""
     import sys
     import types
 
@@ -313,16 +315,147 @@ def test_vertex_embedder_degrades_without_network(monkeypatch, caplog):
 
     fake.VertexAIEmbeddings = BadEmbeddings
     monkeypatch.setitem(sys.modules, "langchain_google_vertexai", fake)
-    e = VertexEmbedder()
+    e = VertexEmbedder(timeout_s=5)
     with caplog.at_level("WARNING"):
         assert e.embed(["x"]) is None
-        assert e.embed(["y"]) is None  # checked once, no second attempt
-    assert e.available is False
-    assert sum("falling back to keyword search" in r.getMessage() for r in caplog.records) == 1
+        assert e.available is True  # one failure: this call fell back, embeddings still enabled
+        assert e.embed(["y"]) is None
+        assert e.embed(["z"]) is None
+    assert e.available is False  # 3 consecutive failures -> disabled for the cool-down
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("falling back to keyword search" in m for m in msgs) == 1  # first failure only
+    assert sum("disabled for 10 min" in m for m in msgs) == 1
     store = MemoryStore("sqlite:///:memory:", embedder=e)
     assert store.embeddings_enabled is False
     store.put("facts:shared", "keyword only fact")
     assert [m.text for m in store.search("facts:shared", "keyword fact")] == ["keyword only fact"]
+
+
+class _FakeEmbeddings:
+    """Stand-in for VertexAIEmbeddings: optional sleep before answering, call counting."""
+
+    def __init__(self, sleep_s: float = 0.0, dim: int = 4):
+        self.sleep_s, self.dim, self.calls = sleep_s, dim, 0
+
+    def _vec(self, text):
+        return [float(len(text)), 1.0, 0.0, 0.0][: self.dim]
+
+    def embed_query(self, text):
+        self.calls += 1
+        if self.sleep_s:
+            time.sleep(self.sleep_s)
+        return self._vec(text)
+
+    def embed_documents(self, texts):
+        self.calls += 1
+        if self.sleep_s:
+            time.sleep(self.sleep_s)
+        return [self._vec(t) for t in texts]
+
+
+class _Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def test_vertex_embedder_happy_path_runs_off_caller_thread():
+    from providers.memory_store import VertexEmbedder
+
+    fake = _FakeEmbeddings()
+    seen = []
+
+    def factory(model, project, location):
+        seen.append((model, project, location, threading.current_thread().name))
+        return fake
+
+    e = VertexEmbedder(model="m", project="p", location="l", timeout_s=5, client_factory=factory)
+    assert e.probe() is True
+    assert e.embed(["ab", "abc"]) == [[2.0, 1.0, 0.0, 0.0], [3.0, 1.0, 0.0, 0.0]]
+    assert seen == [("m", "p", "l", "memory-embed")]  # built under the deadline on the worker thread
+    assert fake.calls == 2 and e.available is True and e.failures == 0
+
+
+def test_vertex_embedder_deadline_never_blocks_caller(caplog):
+    """A hung embeddings call returns None within the deadline and the caller keeps going."""
+    from providers.memory_store import VertexEmbedder
+
+    fake = _FakeEmbeddings(sleep_s=3.0)
+    e = VertexEmbedder(timeout_s=0.2, client_factory=lambda *a: fake)
+    t0 = time.monotonic()
+    with caplog.at_level("WARNING"):
+        assert e.embed(["slow"]) is None
+    assert time.monotonic() - t0 < 1.5
+    assert e.failures == 1 and e.available is True
+    assert any("timed out after 0.2s" in r.getMessage() and "keyword search for this call" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_vertex_embedder_circuit_breaker_opens_and_recovers(caplog):
+    from providers.memory_store import EMBED_COOLDOWN_S, VertexEmbedder
+
+    clock = _Clock()
+    good = _FakeEmbeddings()
+    calls = {"n": 0}
+
+    def flaky_documents(texts):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise RuntimeError("503 backend")
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    good.embed_documents = flaky_documents
+    e = VertexEmbedder(timeout_s=5, client_factory=lambda *a: good, clock=clock)
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            assert e.embed(["x"]) is None
+        assert e.available is False
+        assert e.embed(["x"]) is None  # short-circuited: no call while the breaker is open
+    assert calls["n"] == 3
+    assert sum("disabled for 10 min" in r.getMessage() for r in caplog.records) == 1
+    clock.t += EMBED_COOLDOWN_S + 1
+    assert e.available is True
+    assert e.embed(["x"]) == [[1.0, 0.0, 0.0, 0.0]]  # recovered after the cool-down
+    assert e.failures == 0
+
+
+def test_vertex_embedder_import_error_is_permanent(caplog):
+    from providers.memory_store import VertexEmbedder
+
+    def no_module(*a):
+        raise ImportError("no langchain_google_vertexai")
+
+    e = VertexEmbedder(timeout_s=5, client_factory=no_module)
+    with caplog.at_level("WARNING"):
+        assert e.probe() is False
+    assert e.available is False and e.permanently_off is True
+    assert e.embed(["x"]) is None
+
+
+def test_embed_timeout_env(monkeypatch):
+    from providers.memory_store import embed_timeout_s
+
+    monkeypatch.delenv("MEMORY_EMBED_TIMEOUT_S", raising=False)
+    assert embed_timeout_s() == 20.0
+    monkeypatch.setenv("MEMORY_EMBED_TIMEOUT_S", "7.5")
+    assert embed_timeout_s() == 7.5
+    monkeypatch.setenv("MEMORY_EMBED_TIMEOUT_S", "-1")
+    assert embed_timeout_s() == 20.0
+    monkeypatch.setenv("MEMORY_EMBED_TIMEOUT_S", "later")
+    assert embed_timeout_s() == 20.0
+
+
+def test_store_warm_runs_probe_and_reports():
+    from providers.memory_store import VertexEmbedder
+
+    fake = _FakeEmbeddings()
+    e = VertexEmbedder(timeout_s=5, client_factory=lambda *a: fake)
+    store = MemoryStore("sqlite:///:memory:", embedder=e)
+    assert store.warm() is True and fake.calls == 1
+    assert MemoryStore("sqlite:///:memory:", embedder=None).warm() is False
+    assert MemoryStore("sqlite:///:memory:", embedder=HashEmbedder()).warm() is True  # no probe: just the flag
 
 
 def test_episode_ttl_env(monkeypatch):

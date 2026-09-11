@@ -27,16 +27,35 @@ SLACK_BOT_DB is the checkpoint database path (default data/slack_bot.db).
 
 ONE LISTENER RULE: only one process may hold the Socket Mode connection for this
 app token at a time; two listeners both reply to every message.
+
+RESILIENCE (after the 2026-09-11 incident, where a first-use Vertex embeddings probe ran on
+the event loop and hung, freezing the whole bot with a placeholder dangling for 45 min):
+
+* Nothing blocking runs on the event loop. The memory store (SQLite open + embeddings
+  probe) is initialised in a worker thread at start-up (``warm_memory_store``) and every
+  later use resolves the store *inside* ``asyncio.to_thread``. Model calls are async
+  (``agent.ainvoke``); tools run in LangGraph's executor threads. A loop-lag watchdog logs
+  ``event loop stalled for X s`` whenever a 2 s sleep wakes more than 3 s late.
+* Per-request deadline: ``asyncio.wait_for(answer(...), 240)`` plus a failsafe task that,
+  270 s in, force-updates the placeholder through a fresh Slack client if the handler is
+  still alive (e.g. ``chat_update`` itself hanging) and logs the stuck task's stack.
+* In-flight placeholders are persisted to ``data/slack_inflight.json`` and removed once the
+  final ``chat_update`` succeeds. SIGTERM/SIGINT stop new events, wait up to
+  ``SLACK_SHUTDOWN_GRACE_S`` (20 s) for running requests, then mark every leftover
+  placeholder ":warning: I was restarted…" and exit 0. Start-up sweeps the file for
+  leftovers from a crash / kill -9 (entries older than 24 h are just dropped).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import logging
 import os
 import json
 import re
+import signal
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -65,16 +84,27 @@ RESET_WORDS = {"reset", "new topic", "new conversation", "start over", "clear", 
 RESET_TEXT = ":broom: Started a fresh conversation. Earlier context in this channel is forgotten."
 
 AGENT_TIMEOUT = 240  # seconds; a full write-up over several tokens is slow
+FAILSAFE_EXTRA_S = 30  # the failsafe watchdog fires this long after the agent deadline
+SLACK_CALL_TIMEOUT_S = 15  # cap on the recovery chat_update calls (failsafe, shutdown, sweep)
+SHUTDOWN_GRACE_S = float(os.getenv("SLACK_SHUTDOWN_GRACE_S", "20"))  # wait this long for in-flight requests
+INFLIGHT_MAX_AGE_S = 24 * 3600  # leftovers older than this are dropped, not updated
+LOOP_LAG_INTERVAL_S = 2.0
+LOOP_LAG_THRESHOLD_S = 3.0
+DEFAULT_INFLIGHT = "data/slack_inflight.json"
 PLACEHOLDER = ":hourglass_flowing_sand: Working on it…"
 TIMEOUT_TEXT = ":warning: That took too long and I gave up. Try a narrower question (fewer tokens, or skip the full report)."
 ERROR_TEXT = ":warning: Something went wrong on my side. The error has been logged."
+RESTART_TEXT = ":warning: I was restarted before finishing this request — please ask again."
+BUSY_TEXT = ":warning: I am restarting right now — please ask again in a minute."
 EMPTY_TEXT = "_(no response)_"
 
 MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 
 __all__ = ["clean", "to_mrkdwn", "chunk_text", "handle", "answer", "should_handle_dm",
            "conversation_key", "SessionStore", "is_reset", "build_agent", "build_app", "current_time", "RecordingClient",
-           "spawn_episode", "flush_background", "episode_llm"]
+           "spawn_episode", "flush_background", "episode_llm",
+           "InflightStore", "get_inflight", "warm_memory_store", "sweep_inflight", "shutdown", "loop_lag_watchdog",
+           "STATE", "ACTIVE_REQUESTS", "RESTART_TEXT"]
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +309,98 @@ def conversation_key(event: dict, sessions: SessionStore | None = None) -> tuple
 
 
 # ---------------------------------------------------------------------------
+# In-flight placeholders (survive restarts) + process state
+# ---------------------------------------------------------------------------
+
+class InflightStore:
+    """Placeholders posted but not yet replaced by a final answer, persisted as JSON.
+
+    ``{"<channel>:<ts>": {"channel", "ts", "user", "thread_ts", "started"}}``. An entry is
+    added when the ":hourglass: Working on it" message is posted and removed when the final
+    ``chat_update`` succeeds, so whatever is in the file at start-up (or at shutdown, after
+    the grace period) is a message a user is still staring at. ``persist=False`` keeps it in
+    memory only (selftest).
+    """
+
+    def __init__(self, path: str | None = None, now=time.time, persist: bool = True):
+        self.path = Path(path or os.getenv("SLACK_INFLIGHT_FILE", DEFAULT_INFLIGHT))
+        self.now = now
+        self.persist = persist
+        self.entries: dict[str, dict] = {}
+        if persist:
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text())
+            self.entries = {k: dict(v) for k, v in dict(data).items() if isinstance(v, dict)}
+        except (FileNotFoundError, ValueError, OSError):
+            self.entries = {}
+
+    def _save(self) -> None:
+        if not self.persist:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.entries))
+            tmp.replace(self.path)
+        except OSError as e:  # never let bookkeeping break a reply
+            log.warning("could not persist in-flight placeholders to %s: %s", self.path, e)
+
+    @staticmethod
+    def _id(channel: str, ts: str) -> str:
+        return f"{channel}:{ts}"
+
+    def add(self, channel: str, ts: str, user: str, thread_ts: str | None = None) -> dict:
+        entry = {"channel": channel, "ts": ts, "user": user, "thread_ts": thread_ts, "started": self.now()}
+        self.entries[self._id(channel, ts)] = entry
+        self._save()
+        return entry
+
+    def remove(self, channel: str, ts: str) -> None:
+        if self.entries.pop(self._id(channel, ts), None) is not None:
+            self._save()
+
+    def all(self) -> list[dict]:
+        return list(self.entries.values())
+
+    def partition_stale(self, max_age_s: float = INFLIGHT_MAX_AGE_S) -> tuple[list[dict], list[dict]]:
+        """(fresh, stale) split by ``started`` age."""
+        now = self.now()
+        fresh, stale = [], []
+        for e in self.entries.values():
+            (stale if now - float(e.get("started") or 0) > max_age_s else fresh).append(e)
+        return fresh, stale
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+
+_INFLIGHT: Optional[InflightStore] = None
+
+
+def get_inflight() -> InflightStore:
+    global _INFLIGHT
+    if _INFLIGHT is None:
+        _INFLIGHT = InflightStore()
+    return _INFLIGHT
+
+
+class _RuntimeState:
+    """Process-wide flags shared by the listeners, the signal handler and shutdown()."""
+
+    def __init__(self):
+        self.accepting = True          # False once a stop signal arrived: new events are refused
+        self.stop_signal: str | None = None
+        self.bot_token: str | None = None  # for the failsafe's fresh client
+
+
+STATE = _RuntimeState()
+ACTIVE_REQUESTS: set = set()  # asyncio.Tasks currently inside handle()
+
+
+# ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
 
@@ -305,9 +427,34 @@ async def build_agent(db_path: str | None = None, llm=None, tools=None, system_p
 
 
 def _memory_store():
+    """The shared MemoryStore. Its first call opens SQLite; the embeddings probe (a Vertex
+    round-trip) is what ``warm_memory_store`` runs at start-up. Call only from worker threads
+    (``asyncio.to_thread``) - never directly on the event loop."""
     from providers.factory import get_memory_store
 
     return get_memory_store()
+
+
+async def warm_memory_store() -> bool:
+    """Initialise the memory store and run the embeddings probe in a worker thread.
+
+    Done once before the first event so no request ever pays for (or hangs on) the probe,
+    and so that it can never run on the event loop. Returns whether embeddings are usable.
+    """
+    def _warm():
+        store = _memory_store()
+        warm = getattr(store, "warm", None)
+        return bool(warm()) if callable(warm) else bool(getattr(store, "embeddings_enabled", False))
+
+    t0 = time.monotonic()
+    try:
+        enabled = await asyncio.to_thread(_warm)
+    except Exception as e:  # noqa: BLE001 - memory must never stop the bot from starting
+        log.warning("memory store warm-up failed after %.1fs: %s (requests fall back to keyword search)",
+                    time.monotonic() - t0, e)
+        return False
+    log.info("memory store ready in %.1fs (embeddings: %s)", time.monotonic() - t0, "on" if enabled else "keyword only")
+    return enabled
 
 
 async def answer(agent, thread_id: str, user_id: str, text: str, channel_id: str | None = None,
@@ -318,10 +465,17 @@ async def answer(agent, thread_id: str, user_id: str, text: str, channel_id: str
     relevant memories (shared facts, this user's prefs / episodes, this channel's rule) are
     injected into the system prompt of the model call via ``tools.context.current_memory_context``.
     """
+    # DEADLINE CONTRACT: everything awaited here is either native async I/O (agent.ainvoke ->
+    # AsyncAnthropicVertex over httpx; tools run in LangGraph's executor threads) or an
+    # explicit worker thread (asyncio.to_thread). Nothing blocking may run on the event loop,
+    # or handle()'s asyncio.wait_for(answer(), 240) can never fire - the loop that would
+    # raise the TimeoutError is the one stuck. That is exactly what happened on 2026-09-11:
+    # ``_memory_store()`` was evaluated as an argument *before* to_thread, on the loop, and
+    # its first-use embeddings probe hung. Resolve the store inside the thread.
     block = ""
     if recall:
         try:
-            block = await asyncio.to_thread(build_context, user_id, channel_id, text, _memory_store())
+            block = await asyncio.to_thread(lambda: build_context(user_id, channel_id, text, _memory_store()))
         except Exception as e:  # noqa: BLE001 - memory must never block a reply
             log.warning("memory recall failed: %s", e)
     if block:
@@ -372,9 +526,11 @@ async def _summarise(agent, sessions: "SessionStore", info: dict, final: bool) -
         n, done = count_replies(messages), sessions.summarised_replies(key)
         if n == 0 or n <= done or (not final and n - done < EPISODE_EVERY_N_REPLIES):
             return None
-        llm = episode_llm()
-        mem_id = await asyncio.to_thread(record_episode, _memory_store(), user, channel, key, messages, llm,
-                                         info.get("started"), info.get("last") or time.time())
+        ended = info.get("last") or time.time()
+        # store + LLM factory resolved inside the worker thread (never on the loop, see answer())
+        mem_id = await asyncio.to_thread(
+            lambda: record_episode(_memory_store(), user, channel, key, messages, episode_llm(),
+                                   info.get("started"), ended))
         if mem_id:
             sessions.mark_summarised(key, n)
             log.info("episode %s stored for user=%s session=%s (%d replies, final=%s)", mem_id[:8], user, key, n, final)
@@ -411,8 +567,16 @@ def _flush_closed(agent, sessions: "SessionStore") -> None:
 # ---------------------------------------------------------------------------
 
 async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, react: bool = True,
-                 sessions: SessionStore | None = None) -> None:
-    """Placeholder -> agent -> update placeholder (+ threaded overflow chunks)."""
+                 sessions: SessionStore | None = None, inflight: InflightStore | None = None,
+                 failsafe_extra: float = FAILSAFE_EXTRA_S, fallback_client_factory=None) -> None:
+    """Placeholder -> agent -> update placeholder (+ threaded overflow chunks).
+
+    The placeholder is tracked in ``inflight`` until the final ``chat_update`` succeeds, and a
+    failsafe task force-updates it via ``fallback_client_factory()`` (default: a fresh
+    ``AsyncWebClient``) if this coroutine is still running ``timeout + failsafe_extra``
+    seconds after the placeholder was posted.
+    """
+    t0 = time.monotonic()
     channel = event["channel"]
     user = event.get("user", "unknown")
     is_dm = event.get("channel_type") == "im"
@@ -443,35 +607,184 @@ async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, 
     if reply_ts:
         post_kwargs["thread_ts"] = reply_ts
     placeholder = await client.chat_postMessage(**post_kwargs)
-    if not reply_ts and event.get("channel_type") != "im" and placeholder.get("ts"):
+    p_ts = placeholder.get("ts")
+    if not reply_ts and event.get("channel_type") != "im" and p_ts:
         # top-level answer: a follow-up threaded under the bot's reply continues this session
-        sessions.remember_thread(channel, placeholder["ts"], thread_id)
+        sessions.remember_thread(channel, p_ts, thread_id)
 
-    ok = False
+    inflight = get_inflight() if inflight is None else inflight
+    task = asyncio.current_task()
+    done = asyncio.Event()
+    watchdog = None
+    if p_ts:
+        inflight.add(channel, p_ts, user, reply_ts)
+        watchdog = asyncio.create_task(
+            _failsafe(channel, p_ts, done, task, timeout + failsafe_extra, fallback_client_factory, inflight),
+            name=f"failsafe:{channel}:{p_ts}")
+    if task is not None:
+        ACTIVE_REQUESTS.add(task)
     try:
-        reply = await asyncio.wait_for(answer(agent, thread_id, user, text, channel_id=channel, is_dm=is_dm),
-                                       timeout=timeout)
-        ok = True
-    except asyncio.TimeoutError:
-        log.warning("agent timed out after %ss thread=%s", timeout, thread_id)
-        reply = TIMEOUT_TEXT
-    except Exception:  # noqa: BLE001
-        log.exception("agent failed thread=%s", thread_id)
-        reply = ERROR_TEXT
-    if ok:
-        # every 6th reply: roll the session into an episode summary (background)
-        spawn_episode(agent, sessions, {"key": thread_id, "channel": channel, "user": user,
-                                        "started": SessionStore._started(thread_id, {"last": time.time()}),
-                                        "last": time.time()}, final=False)
+        ok = False
+        try:
+            # This deadline only works because answer() awaits nothing blocking (see its comment).
+            reply = await asyncio.wait_for(answer(agent, thread_id, user, text, channel_id=channel, is_dm=is_dm),
+                                           timeout=timeout)
+            ok = True
+        except asyncio.TimeoutError:
+            log.warning("agent timed out after %ss thread=%s", timeout, thread_id)
+            reply = TIMEOUT_TEXT
+        except Exception:  # noqa: BLE001
+            log.exception("agent failed thread=%s", thread_id)
+            reply = ERROR_TEXT
+        if ok:
+            # every 6th reply: roll the session into an episode summary (background)
+            spawn_episode(agent, sessions, {"key": thread_id, "channel": channel, "user": user,
+                                            "started": SessionStore._started(thread_id, {"last": time.time()}),
+                                            "last": time.time()}, final=False)
 
-    reply = to_mrkdwn(reply) or EMPTY_TEXT
-    chunks = chunk_text(reply, CHUNK_CHARS)
-    await client.chat_update(channel=channel, ts=placeholder["ts"], text=chunks[0])
-    # Overflow goes under the reply (its own thread when answering top-level) so the channel stays tidy.
-    overflow_ts = reply_ts or placeholder["ts"]
-    for extra in chunks[1:]:
-        await client.chat_postMessage(channel=channel, thread_ts=overflow_ts, text=extra)
-    log.info("replied thread=%s chunks=%d chars=%d", thread_id, len(chunks), len(reply))
+        reply = to_mrkdwn(reply) or EMPTY_TEXT
+        chunks = chunk_text(reply, CHUNK_CHARS)
+        await client.chat_update(channel=channel, ts=p_ts, text=chunks[0])
+        if p_ts:
+            inflight.remove(channel, p_ts)  # the user now sees the answer (or the warning)
+        # Overflow goes under the reply (its own thread when answering top-level) so the channel stays tidy.
+        overflow_ts = reply_ts or p_ts
+        for extra in chunks[1:]:
+            await client.chat_postMessage(channel=channel, thread_ts=overflow_ts, text=extra)
+        log.info("replied thread=%s chunks=%d chars=%d in %.1fs%s", thread_id, len(chunks), len(reply),
+                 time.monotonic() - t0, "" if ok else " (fallback text)")
+    finally:
+        done.set()
+        if watchdog is not None:
+            watchdog.cancel()
+        if task is not None:
+            ACTIVE_REQUESTS.discard(task)
+
+
+def _default_fallback_client():
+    """A fresh slack_sdk AsyncWebClient (own connection, short timeout) for recovery updates."""
+    from slack_sdk.web.async_client import AsyncWebClient
+
+    token = STATE.bot_token or os.getenv("SLACK_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("no bot token available for the fallback Slack client")
+    return AsyncWebClient(token=token, timeout=SLACK_CALL_TIMEOUT_S)
+
+
+async def _failsafe(channel: str, ts: str, done: asyncio.Event, task, delay: float, fallback_client_factory,
+                    inflight: InflightStore) -> None:
+    """Second line of defence behind asyncio.wait_for: if handle() has not finished ``delay``
+    seconds after posting the placeholder (its own chat_update hanging, a tool thread wedged
+    while the loop is fine, ...), replace the placeholder through a *fresh* client with a 15 s
+    cap, log the stuck task's stack at ERROR and cancel it."""
+    try:
+        await asyncio.wait_for(done.wait(), delay)
+        return
+    except asyncio.TimeoutError:
+        pass
+    except asyncio.CancelledError:
+        raise
+    buf = io.StringIO()
+    if task is not None:
+        try:
+            task.print_stack(file=buf)
+        except Exception:  # noqa: BLE001
+            pass
+    log.error("failsafe: request channel=%s ts=%s still running %.0fs after its placeholder; forcing the "
+              "timeout text onto it. Stuck task stack:\n%s", channel, ts, delay, buf.getvalue().strip() or "<unavailable>")
+    try:
+        fb = (fallback_client_factory or _default_fallback_client)()
+        await asyncio.wait_for(fb.chat_update(channel=channel, ts=ts, text=TIMEOUT_TEXT), SLACK_CALL_TIMEOUT_S)
+        inflight.remove(channel, ts)
+    except Exception as e:  # noqa: BLE001
+        log.error("failsafe: fallback chat_update failed for %s:%s: %s", channel, ts, e)
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Recovery: start-up sweep, graceful shutdown, loop-lag watchdog
+# ---------------------------------------------------------------------------
+
+async def _warn_placeholders(client, inflight: InflightStore, entries: list[dict], reason: str) -> int:
+    """Replace each dangling placeholder with RESTART_TEXT (15 s cap each); drop it from the file either way."""
+    n = 0
+    for e in entries:
+        channel, ts = e.get("channel"), e.get("ts")
+        try:
+            await asyncio.wait_for(client.chat_update(channel=channel, ts=ts, text=RESTART_TEXT), SLACK_CALL_TIMEOUT_S)
+            n += 1
+            log.info("%s: placeholder %s:%s (user %s) marked as interrupted", reason, channel, ts, e.get("user"))
+        except Exception as ex:  # noqa: BLE001
+            log.warning("%s: could not update placeholder %s:%s: %s", reason, channel, ts, ex)
+        inflight.remove(channel, ts)
+    return n
+
+
+async def sweep_inflight(client, inflight: InflightStore | None = None,
+                         max_age_s: float = INFLIGHT_MAX_AGE_S) -> tuple[int, int]:
+    """Start-up: placeholders left by a crash / kill -9 get RESTART_TEXT; entries older than
+    ``max_age_s`` are just dropped. The inflight file is the only source of truth - channels
+    are never scanned. Returns (updated, dropped)."""
+    inflight = get_inflight() if inflight is None else inflight
+    fresh, stale = inflight.partition_stale(max_age_s)
+    for e in stale:
+        log.info("startup sweep: dropping stale placeholder %s:%s (%.1f h old)", e.get("channel"), e.get("ts"),
+                 (inflight.now() - float(e.get("started") or 0)) / 3600)
+        inflight.remove(e.get("channel"), e.get("ts"))
+    n = await _warn_placeholders(client, inflight, fresh, "startup sweep")
+    log.info("startup sweep: %d dangling placeholder(s) from before the restart updated, %d stale dropped "
+             "(file %s)", n, len(stale), inflight.path)
+    return n, len(stale)
+
+
+async def shutdown(client, inflight: InflightStore | None = None, grace_s: float | None = None,
+                   active: set | None = None) -> int:
+    """Graceful stop: refuse new events, give running requests ``grace_s`` to finish, cancel the
+    rest and mark every placeholder still in the inflight file as interrupted. Returns the
+    number of placeholders updated."""
+    STATE.accepting = False
+    grace_s = SHUTDOWN_GRACE_S if grace_s is None else grace_s
+    active = ACTIVE_REQUESTS if active is None else active
+    inflight = get_inflight() if inflight is None else inflight
+    pending = [t for t in list(active) if not t.done()]
+    if pending:
+        log.info("shutdown: waiting up to %.0fs for %d in-flight request(s)", grace_s, len(pending))
+        await asyncio.wait(pending, timeout=grace_s)
+        stuck = [t for t in pending if not t.done()]
+        for t in stuck:
+            t.cancel()
+        if stuck:
+            await asyncio.gather(*stuck, return_exceptions=True)
+            log.warning("shutdown: %d request(s) did not finish within %.0fs and were cancelled", len(stuck), grace_s)
+    n = await _warn_placeholders(client, inflight, inflight.all(), "shutdown")
+    log.info("shutdown: %d in-flight request(s) finished in time, %d placeholder(s) marked as interrupted",
+             len(pending) - n if pending else 0, n)
+    return n
+
+
+async def loop_lag_watchdog(interval: float = LOOP_LAG_INTERVAL_S, threshold: float = LOOP_LAG_THRESHOLD_S,
+                            clock=time.monotonic) -> None:
+    """Sleep ``interval`` forever; log WARNING when a wake-up is more than ``threshold`` late.
+    A late wake-up means something ran blocking code on the event loop."""
+    while True:
+        expected = clock() + interval
+        await asyncio.sleep(interval)
+        lag = clock() - expected
+        if lag > threshold:
+            log.warning("event loop stalled for %.1f s (blocking call on the loop?)", lag)
+
+
+def _request_stop(stop: asyncio.Event, signum: int) -> None:
+    name = signal.Signals(signum).name if signum in signal.Signals._value2member_map_ else str(signum)
+    if STATE.stop_signal:
+        log.warning("received %s while already shutting down (%s); still waiting for in-flight requests", name,
+                    STATE.stop_signal)
+        return
+    STATE.stop_signal = name
+    STATE.accepting = False
+    log.info("received %s: no new events accepted; shutting down gracefully", name)
+    stop.set()
 
 
 def build_app(agent, bot_token: str):
@@ -480,17 +793,30 @@ def build_app(agent, bot_token: str):
 
     app = AsyncApp(token=bot_token)
 
+    async def dispatch(event, client):
+        if not STATE.accepting:
+            log.warning("shutting down: refusing event from user=%s channel=%s", event.get("user"), event.get("channel"))
+            kwargs = {"channel": event["channel"], "text": BUSY_TEXT}
+            if event.get("thread_ts"):
+                kwargs["thread_ts"] = event["thread_ts"]
+            try:
+                await asyncio.wait_for(client.chat_postMessage(**kwargs), SLACK_CALL_TIMEOUT_S)
+            except Exception as e:  # noqa: BLE001
+                log.debug("busy notice failed: %s", e)
+            return
+        await handle(event, client, agent)
+
     @app.event("app_mention")
     async def on_mention(event, client):
         if event.get("bot_id"):
             return
-        await handle(event, client, agent)
+        await dispatch(event, client)
 
     @app.event("message")
     async def on_message(event, client):
         # Only DMs here; channel messages arrive via app_mention.
         if should_handle_dm(event):
-            await handle(event, client, agent)
+            await dispatch(event, client)
 
     return app
 
@@ -544,6 +870,14 @@ async def run_bot() -> int:
                   "secrets trading_signals_slack_bot_token / trading_signals_slack_app_token")
         return 2
 
+    STATE.bot_token = bot_token
+    STATE.accepting = True
+    STATE.stop_signal = None
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _request_stop, stop, sig)
+
     async with build_agent() as agent:
         sessions = get_sessions()
         stale = sessions.expire_stale()
@@ -552,12 +886,28 @@ async def run_bot() -> int:
             for info in stale:
                 spawn_episode(agent, sessions, info, final=True)
         app = build_app(agent, bot_token)
+        # Order matters: clean up what the previous process left, warm the memory store in a
+        # thread (so the first request never runs the embeddings probe on the loop), then connect.
+        await sweep_inflight(app.client)
+        await warm_memory_store()
+        lag_task = asyncio.create_task(loop_lag_watchdog(), name="loop-lag-watchdog")
         handler = AsyncSocketModeHandler(app, app_token)
-        log.info("starting Socket Mode (db=%s)", os.getenv("SLACK_BOT_DB", DEFAULT_DB))
+        log.info("starting Socket Mode (db=%s, inflight=%s, shutdown grace %.0fs)",
+                 os.getenv("SLACK_BOT_DB", DEFAULT_DB), get_inflight().path, SHUTDOWN_GRACE_S)
         try:
-            await handler.start_async()
+            await handler.connect_async()
+            log.info("Bolt app is running (Socket Mode); pid %d", os.getpid())
+            await stop.wait()
+            # Stop receiving events first (the socket), then let running handlers finish.
+            try:
+                await asyncio.wait_for(handler.close_async(), SLACK_CALL_TIMEOUT_S)
+            except Exception as e:  # noqa: BLE001
+                log.warning("closing the Socket Mode connection failed: %s", e)
+            await shutdown(app.client)
         finally:
+            lag_task.cancel()
             await flush_background()
+    log.info("exited cleanly after %s", STATE.stop_signal or "stop")
     return 0
 
 
@@ -567,7 +917,8 @@ async def run_selftest(question: str) -> int:
     event = {"type": "app_mention", "channel": "CSELFTEST", "user": "USELFTEST",
              "ts": "1.000000", "text": f"<@UBOT> {question}"}
     async with build_agent() as agent:
-        await handle(event, client, agent)
+        await warm_memory_store()
+        await handle(event, client, agent, inflight=InflightStore(persist=False))
         await flush_background()
     print("--- placeholder posted:", client.posts[0]["text"] if client.posts else None)
     print("--- reaction:", [r["name"] for r in client.reactions])

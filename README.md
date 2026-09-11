@@ -231,14 +231,65 @@ Chat tools: `get_options_snapshot(token)`, `get_vol_term_structure(token)`,
 `get_options_flow(token, days)`, `get_gamma_exposure(token)`; `get_zscore_signals` and
 `get_token_metrics` include the options columns automatically for listed tokens.
 
-### Restarting the bot safely
+### Operations: restarts, timeouts, watchdogs
 
-Kill by an anchored pattern so the shell running the command does not match itself:
+**Restart = `kill <pid>` (SIGTERM).** The bot handles SIGTERM/SIGINT gracefully: it stops
+accepting events (anything arriving meanwhile gets ":warning: I am restarting right now —
+please ask again in a minute."), closes the Socket Mode connection, waits up to
+`SLACK_SHUTDOWN_GRACE_S` (default 20 s) for in-flight requests to finish and post their
+answers, cancels the rest, replaces every remaining ":hourglass_flowing_sand: Working on it…"
+placeholder with ":warning: I was restarted before finishing this request — please ask
+again." and exits 0. Kill by an anchored pattern so the shell running the command does not
+match itself; never `kill -9` unless the process is actually hung (then the next start-up
+cleans up, see below):
 
 ```bash
-for pid in $(pgrep -f '^\.venv/bin/python slack_bot\.py'); do kill $pid; done
+for pid in $(pgrep -f '^\.venv/bin/python slack_bot\.py'); do kill -TERM $pid; done
+sleep 5
 nohup .venv/bin/python slack_bot.py -v > data/slack_bot.log 2>&1 &
+pgrep -af '^\.venv/bin/python slack_bot\.py'    # exactly one pid
 ```
+
+`deploy/trading-signals-slack.service` uses `KillSignal=SIGTERM` and `TimeoutStopSec=30`
+(grace 20 s + margin), so `systemctl --user restart` takes the same path.
+
+**In-flight file.** `data/slack_inflight.json` (env `SLACK_INFLIGHT_FILE`) holds every
+placeholder the bot has posted but not yet replaced: `{"<channel>:<ts>": {channel, ts, user,
+thread_ts, started}}`. An entry is written when the placeholder is posted and removed when
+the final `chat_update` succeeds. It is the single source of truth for cleanup - the bot
+never scans channel history. At start-up (`startup sweep: ...` log line) whatever is left
+from a crash or `kill -9` is updated with the restart warning; entries older than 24 h are
+dropped without a Slack call. `--selftest` uses an in-memory copy and never touches the file.
+
+**Start-up order** (all logged): stale sessions -> startup sweep -> `memory store ready in
+X s (embeddings: on|keyword only)` -> `Bolt app is running`. The memory store (SQLite open
+plus the Vertex embeddings probe) is initialised in a worker thread *before* the socket
+connects, so no request ever runs it - the 2026-09-11 incident was a first-use embeddings
+probe evaluated on the event loop, which froze the bot with a placeholder dangling for
+45 minutes and defeated the request timeout (the loop that would have raised it was the
+one stuck).
+
+**Timeouts** (all overridable by env):
+
+| Layer | Default | Env | Behaviour when hit |
+|---|---|---|---|
+| LLM call (`utils/llm.py`) | 120 s, 1 retry | `LLM_TIMEOUT_S`, `LLM_MAX_RETRIES` | anthropic `APITimeoutError`; the agent turn fails -> ":warning: Something went wrong" |
+| Embeddings call (`providers/memory_store.py`) | 20 s | `MEMORY_EMBED_TIMEOUT_S` | that call falls back to keyword search; 3 consecutive failures disable embeddings for 10 min (logged once), then retried |
+| Request (`slack_bot.handle`) | 240 s | - | ":warning: That took too long and I gave up…" |
+| Failsafe watchdog | 240 + 30 s | - | if the handler is *still* running (e.g. `chat_update` hung) a fresh Slack client with a 15 s cap forces the timeout text onto the placeholder, the stuck task's stack is logged at ERROR and the task is cancelled |
+| Shutdown grace | 20 s | `SLACK_SHUTDOWN_GRACE_S` | remaining requests cancelled, placeholders marked as interrupted |
+
+The request deadline only works because `answer()` awaits nothing blocking: model calls
+are async, tools run in LangGraph's executor threads, and memory recall / episode writes
+resolve the store *inside* `asyncio.to_thread`. Keep it that way - any sync network call
+added to the loop can freeze the bot again. Every embeddings call runs on a daemon thread
+with a hard deadline, so a hung Vertex call can never block its caller (loop or tool
+thread) beyond 20 s.
+
+**Loop-lag watchdog.** A background task sleeps 2 s in a loop and logs
+`WARNING event loop stalled for X s` whenever it wakes more than 3 s late - the signature
+of blocking code on the loop. Every reply logs its wall time (`replied ... in 9.0s`).
+If you see stalls, find the sync call and move it to a thread.
 
 ### IPv4-first name resolution
 

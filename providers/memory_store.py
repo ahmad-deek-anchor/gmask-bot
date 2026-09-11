@@ -31,6 +31,7 @@ calls in threads and the Slack bot summarises sessions in background tasks).
 from __future__ import annotations
 
 import array
+import concurrent.futures
 import json
 import logging
 import math
@@ -38,6 +39,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -133,57 +135,157 @@ class HashEmbedder:
         return out
 
 
-class VertexEmbedder:
-    """Lazy ``langchain_google_vertexai.VertexAIEmbeddings``; verified live once, then either
-    used or permanently disabled (``available`` False) with a single WARNING."""
+DEFAULT_EMBED_TIMEOUT_S = 20.0
+EMBED_FAILURES_TO_TRIP = 3        # consecutive failures before the circuit breaker opens
+EMBED_COOLDOWN_S = 600.0          # keyword-only for this long once it has opened
 
-    def __init__(self, model: str | None = None, project: str | None = None, location: str | None = None):
+
+def embed_timeout_s() -> float:
+    """Hard deadline for one embeddings call (env ``MEMORY_EMBED_TIMEOUT_S``, default 20 s)."""
+    raw = os.getenv("MEMORY_EMBED_TIMEOUT_S", "")
+    try:
+        val = float(raw) if raw.strip() else DEFAULT_EMBED_TIMEOUT_S
+    except ValueError:
+        val = DEFAULT_EMBED_TIMEOUT_S
+    return val if val > 0 else DEFAULT_EMBED_TIMEOUT_S
+
+
+def call_with_deadline(fn: Callable[[], Any], timeout: float):
+    """Run ``fn()`` on a daemon thread and wait at most ``timeout`` seconds for its result.
+
+    Raises ``concurrent.futures.TimeoutError`` when the deadline passes; the thread is left
+    to finish (or hang) on its own and, being a daemon, never blocks interpreter exit. This
+    is what makes a hung embeddings call unable to block the caller - the Slack bot's event
+    loop included - beyond the deadline.
+    """
+    fut: concurrent.futures.Future = concurrent.futures.Future()
+
+    def runner():
+        try:
+            fut.set_result(fn())
+        except BaseException as e:  # noqa: BLE001 - re-raised in the caller
+            fut.set_exception(e)
+
+    threading.Thread(target=runner, name="memory-embed", daemon=True).start()
+    return fut.result(timeout=timeout)
+
+
+def _vertex_embeddings_client(model: str, project: str, location: str):
+    import warnings
+
+    from langchain_google_vertexai import VertexAIEmbeddings
+
+    with warnings.catch_warnings():
+        # langchain-google-vertexai 3.2 deprecates this class in favour of the GenAI package;
+        # text-embedding-005 on Vertex still needs it.
+        warnings.simplefilter("ignore")
+        return VertexAIEmbeddings(model_name=model, project=project, location=location)
+
+
+class VertexEmbedder:
+    """Lazy ``langchain_google_vertexai.VertexAIEmbeddings`` behind a hard deadline and a
+    circuit breaker.
+
+    Every call (the one-off probe that builds the client and every ``embed_documents``) runs
+    on a worker thread and is abandoned after ``timeout_s`` (env ``MEMORY_EMBED_TIMEOUT_S``,
+    default 20 s). A timeout or error makes *that* call fall back to keyword search (returns
+    ``None``); after ``EMBED_FAILURES_TO_TRIP`` consecutive failures embeddings are disabled
+    for ``EMBED_COOLDOWN_S`` (10 min, logged once) and then retried. A missing dependency
+    (ImportError) disables them for good.
+
+    ``client_factory(model, project, location)`` and ``clock`` are injection points for tests.
+    """
+
+    def __init__(self, model: str | None = None, project: str | None = None, location: str | None = None,
+                 timeout_s: float | None = None, client_factory: Callable[..., Any] | None = None,
+                 clock: Callable[[], float] = time.monotonic):
         self.model = model or os.getenv("MEMORY_EMBED_MODEL") or DEFAULT_EMBED_MODEL
         self.project = project or os.getenv("MEMORY_EMBED_PROJECT") or os.getenv("VERTEX_PROJECT") or DEFAULT_EMBED_PROJECT
         self.location = location or os.getenv("MEMORY_EMBED_LOCATION") or DEFAULT_EMBED_LOCATION
+        self.timeout_s = float(timeout_s) if timeout_s is not None else embed_timeout_s()
+        self._client_factory = client_factory or _vertex_embeddings_client
+        self._clock = clock
         self._client = None
-        self._checked = False
-        self.available = True
         self._lock = threading.Lock()
+        self.failures = 0                 # consecutive failures
+        self.disabled_until = 0.0         # monotonic time the breaker closes again
+        self.permanently_off = False      # ImportError: nothing to retry
 
-    def _ensure(self) -> bool:
-        if self._checked:
-            return self.available
+    @property
+    def available(self) -> bool:
+        """False while the circuit breaker is open (or embeddings are permanently off)."""
+        return not self.permanently_off and self._clock() >= self.disabled_until
+
+    # -- bookkeeping -------------------------------------------------------
+
+    def _succeeded(self) -> None:
+        self.failures = 0
+
+    def _failed(self, exc: BaseException, what: str) -> None:
+        self.failures += 1
+        detail = f"{type(exc).__name__}: {str(exc).splitlines()[0][:200] if str(exc) else ''}".rstrip(": ")
+        if isinstance(exc, concurrent.futures.TimeoutError):
+            detail = f"timed out after {self.timeout_s:g}s"
+        if self.failures >= EMBED_FAILURES_TO_TRIP:
+            self.disabled_until = self._clock() + EMBED_COOLDOWN_S
+            self.failures = 0
+            logger.warning("Memory embeddings disabled for %d min after %d consecutive failures (%s: %s); "
+                           "keyword search until then", int(EMBED_COOLDOWN_S // 60), EMBED_FAILURES_TO_TRIP, what, detail)
+        elif self.failures == 1:
+            logger.warning("Memory embeddings %s failed (%s); falling back to keyword search for this call", what, detail)
+        else:
+            logger.debug("Memory embeddings %s failed again (%s); %d/%d", what, detail, self.failures, EMBED_FAILURES_TO_TRIP)
+
+    # -- calls -------------------------------------------------------------
+
+    def _ensure(self):
+        """Return the live client, building and probing it under the deadline on first use."""
+        if self._client is not None:
+            return self._client
         with self._lock:
-            if self._checked:
-                return self.available
+            if self._client is not None:
+                return self._client
             try:
-                import warnings
+                def make():
+                    client = self._client_factory(self.model, self.project, self.location)
+                    probe = client.embed_query("memory store probe")
+                    if not probe or not isinstance(probe[0], float):
+                        raise RuntimeError("empty embedding returned")
+                    return client, len(probe)
 
-                from langchain_google_vertexai import VertexAIEmbeddings
+                client, dim = call_with_deadline(make, self.timeout_s)
+            except ImportError as e:
+                self.permanently_off = True
+                logger.warning("Memory embeddings unavailable (%s); keyword search only", e)
+                raise
+            self._client = client
+            logger.info("Memory embeddings: Vertex %s (%s/%s, dim %d)", self.model, self.project, self.location, dim)
+            return client
 
-                with warnings.catch_warnings():
-                    # langchain-google-vertexai 3.2 deprecates this class in favour of the GenAI package;
-                    # text-embedding-005 on Vertex still needs it.
-                    warnings.simplefilter("ignore")
-                    client = VertexAIEmbeddings(model_name=self.model, project=self.project, location=self.location)
-                probe = client.embed_query("memory store probe")
-                if not probe or not isinstance(probe[0], float):
-                    raise RuntimeError("empty embedding returned")
-                self._client = client
-                self.available = True
-                logger.info("Memory embeddings: Vertex %s (%s/%s, dim %d)", self.model, self.project,
-                            self.location, len(probe))
-            except Exception as e:  # noqa: BLE001 - any failure -> keyword search
-                self.available = False
-                logger.warning("Memory embeddings unavailable (%s: %s); falling back to keyword search",
-                               type(e).__name__, str(e).splitlines()[0][:200])
-            self._checked = True
-            return self.available
+    def probe(self) -> bool:
+        """Build + verify the client now (start-up warm-up, off the event loop). True when embeddings work."""
+        if not self.available:
+            return False
+        try:
+            self._ensure()
+        except Exception as e:  # noqa: BLE001
+            self._failed(e, "probe")
+            return False
+        self._succeeded()
+        return True
 
     def embed(self, texts: Sequence[str]) -> Optional[list[list[float]]]:
-        if not self._ensure():
+        """Vectors for ``texts`` or ``None`` (keyword search for this call) - never blocks past the deadline."""
+        if not self.available:
             return None
         try:
-            return self._client.embed_documents(list(texts))
+            client = self._ensure()
+            vecs = call_with_deadline(lambda: client.embed_documents(list(texts)), self.timeout_s)
         except Exception as e:  # noqa: BLE001
-            logger.warning("Embedding call failed (%s); using keyword search for this call", e)
+            self._failed(e, "call")
             return None
+        self._succeeded()
+        return vecs
 
 
 def default_embedder():
@@ -468,6 +570,18 @@ class MemoryStore:
     @property
     def embeddings_enabled(self) -> bool:
         return self._embedder is not None and getattr(self._embedder, "available", True)
+
+    def warm(self) -> bool:
+        """Run the embedder's probe now (call from a worker thread at start-up so the first
+        request never pays for - or hangs on - it). Returns whether embeddings are usable."""
+        probe = getattr(self._embedder, "probe", None)
+        if callable(probe):
+            try:
+                return bool(probe())
+            except Exception as e:  # noqa: BLE001
+                logger.warning("memory store warm-up failed: %s", e)
+                return False
+        return self.embeddings_enabled
 
     def _embed(self, texts: Sequence[str]) -> Optional[list[list[float]]]:
         if self._embedder is None:
@@ -837,6 +951,7 @@ def _loads(s) -> Any:
 
 __all__ = [
     "Memory", "MemoryStore", "HashEmbedder", "VertexEmbedder", "default_embedder", "keyword_scores", "cosine",
+    "call_with_deadline", "embed_timeout_s",
     "SHARED_FACTS", "prefs_namespace", "rules_namespace", "episodes_namespace", "episode_ttl_days",
     "DEFAULT_DB_URL", "DEFAULT_EPISODE_TTL_DAYS",
     "SqliteSnapshotBackend", "snapshot_backend_from_env", "snapshot_row_dict",

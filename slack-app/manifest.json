@@ -1,0 +1,77 @@
+{
+  "display_information": {
+    "name": "gm-bot",
+    "description": "Global Markets Bot",
+    "background_color": "#3359cc",
+    "long_description": "Here's what I can help with:\r\n\r\nMarket Data & Signals\r\n\u2022 Z-score anomaly signals (volume, OI, funding, liquidations, IV) for any supported token \u2014 \"what's unusual in SOL today?\"\r\n\u2022 Spot price history and performance over any window up to 120 days\r\n\u2022 Perpetual futures: funding rates, open interest, perp volume, liquidations\r\n\u2022 Options (BTC, ETH, SOL, HYPE on Deribit): implied vol, term structure, skew, put/call ratios, dealer gamma, block flow\r\n\u2022 Full written market reports per token\r\n\r\nDesk Book (A1 / OTC)\r\n\u2022 Live portfolio risk snapshot: delta, gamma, vega, theta, gross/net notional\r\n\u2022 PnL history \u2014 by day, strategy or venue (day / WTD / MTD / YTD / LTD)\r\n\u2022 Greeks history and trend\r\n\u2022 Perp positions: what we're running, size, funding PnL, entry vs mark\r\n\u2022 Exposure by underlying (e.g. \"what's our ETH risk?\")\r\n\u2022 OTC derivatives trades (blotter, last N days)\r\n\u2022 Open orders on Talos\r\n\u2022 Internal asset prices (live tick + intraday path)\r\n\u2022 Ad-hoc BigQuery queries on brokerage_a1 and pricing datasets\r\n\r\nWhat I can't do\r\n\u2022 Custody / HOLD balances, CRMS, lending, reporting datasets \u2014 no access\r\n\u2022 Tokens outside the supported universe (use list_token_universe to check)\r\n\u2022 Options data for tokens not listed on Deribit\r\n\u2022 Any write operations or trade execution\r\n\r\nAsk me anything in the areas above \u2014 I'll always pull live data, never guess."
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": true,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "agent_view": {
+      "agent_description": "Hi, I am an agent built using Bolt for JavaScript. I am here to help you out!"
+    },
+    "bot_user": {
+      "display_name": "GM Bot",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "https://ngrok-free.app/slack/oauth_redirect"
+    ],
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "channels:history",
+        "chat:write",
+        "groups:history",
+        "im:history",
+        "im:read",
+        "im:write",
+        "reactions:write",
+        "reactions:read",
+        "users:read",
+        "assistant:write"
+      ],
+      "user": [
+        "channels:history",
+        "channels:read",
+        "groups:history",
+        "groups:read",
+        "im:history",
+        "mpim:history",
+        "users:read",
+        "search:read.public",
+        "search:read.private",
+        "search:read.mpim",
+        "search:read.im",
+        "search:read.files",
+        "search:read.users",
+        "chat:write",
+        "canvases:read",
+        "canvases:write",
+        "users:read.email"
+      ]
+    }
+  },
+  "settings": {
+    "socket_mode_enabled": true,
+    "org_deploy_enabled": true,
+    "interactivity": {
+      "is_enabled": true,
+      "request_url": "https://ngrok-free.app/slack/events"
+    },
+    "event_subscriptions": {
+      "request_url": "https://ngrok-free.app/slack/events",
+      "bot_events": [
+        "app_mention",
+        "message.im"
+      ]
+    },
+    "token_rotation_enabled": false
+  }
+}

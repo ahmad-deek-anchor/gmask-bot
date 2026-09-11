@@ -1,0 +1,15 @@
+# Fires trading-signals-snapshot.service at 23:30 UTC every day (after Haruko's ~23:55 UTC
+# EOD is NOT yet in; the snapshot records the latest intraday portfolio row, and the
+# signals source uses the last complete UTC day).
+# Install: cp deploy/trading-signals-snapshot.* ~/.config/systemd/user/ &&
+#          systemctl --user daemon-reload && systemctl --user enable --now trading-signals-snapshot.timer
+[Unit]
+Description=Daily trading signals data snapshot (23:30 UTC)
+
+[Timer]
+OnCalendar=*-*-* 23:30:00 UTC
+Persistent=true
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

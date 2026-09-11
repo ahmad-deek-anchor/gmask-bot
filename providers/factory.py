@@ -12,6 +12,10 @@
 (read-only desk data in BigQuery), or None when google-cloud-bigquery or
 Application Default Credentials are unavailable.
 
+`get_a1_metrics_sheet()` returns a process-wide providers.gsheets.A1MetricsSheet
+(read-only spot desk PnL from the "A1 Metrics Dashboard" Google Sheet), or None
+when google-auth cannot resolve Application Default Credentials.
+
 There is no local cache; every call hits the upstream API. API keys come from
 utils.config.Config (env var override, else GCP Secret Manager).
 """
@@ -159,3 +163,95 @@ def reset_desk_bigquery() -> None:
     with _desk_bq_lock:
         _desk_bq = None
         _desk_bq_built = False
+
+
+# ----------------------------------------------------------------------
+# Spot desk PnL (Google Sheet "A1 Metrics Dashboard", read-only)
+# ----------------------------------------------------------------------
+
+_a1_sheet = None
+_a1_sheet_built = False
+_a1_sheet_lock = threading.Lock()
+
+
+def get_a1_metrics_sheet():
+    """Shared A1MetricsSheet, or None when google-auth / ADC are unavailable.
+
+    The result (including None) is memoised; call reset_a1_metrics_sheet() to retry.
+    Nothing is fetched here - credentials are only resolved (no network) to prove
+    ADC exists; the first tool call does the HTTP round trip. Thread-safe.
+    """
+    global _a1_sheet, _a1_sheet_built
+    if _a1_sheet_built:
+        return _a1_sheet
+    with _a1_sheet_lock:
+        if _a1_sheet_built:
+            return _a1_sheet
+        sheet = None
+        try:
+            from providers.gsheets import A1MetricsSheet
+            from utils.config import Config
+
+            candidate = A1MetricsSheet.from_config(Config())
+            candidate._get_credentials()  # SheetsUnavailable when ADC is missing
+            sheet = candidate
+            logger.info("Spot desk PnL: Google Sheet %s (quota project %s)",
+                        sheet.spreadsheet_id, sheet.quota_project)
+        except Exception as e:
+            logger.warning("Spot desk PnL sheet unavailable: %s", e)
+        _a1_sheet = sheet
+        _a1_sheet_built = True
+        return _a1_sheet
+
+
+def reset_a1_metrics_sheet() -> None:
+    """Drop the memoised A1MetricsSheet so the next get_a1_metrics_sheet() rebuilds it."""
+    global _a1_sheet, _a1_sheet_built
+    with _a1_sheet_lock:
+        _a1_sheet = None
+        _a1_sheet_built = False
+
+
+# ----------------------------------------------------------------------
+# Long-term memory + daily snapshots (providers/memory_store.py)
+# ----------------------------------------------------------------------
+
+_memory_store = None
+_memory_store_lock = threading.Lock()
+
+
+def get_memory_store():
+    """Shared providers.memory_store.MemoryStore (env MEMORY_DB_URL, default sqlite:///data/memory.db).
+
+    Memoised and lock-guarded: the agent runs tool calls in threads and the Slack bot writes
+    episodes from background tasks. Opening the store touches only the local SQLite file;
+    embeddings (Vertex) are probed lazily on the first put/search and fall back to keyword search.
+    """
+    global _memory_store
+    if _memory_store is not None:
+        return _memory_store
+    with _memory_store_lock:
+        if _memory_store is None:
+            from providers.memory_store import MemoryStore
+
+            _memory_store = MemoryStore()
+        return _memory_store
+
+
+def set_memory_store(store) -> None:
+    """Install a specific store (tests: in-memory SQLite with a hash embedder)."""
+    global _memory_store
+    with _memory_store_lock:
+        _memory_store = store
+
+
+def reset_memory_store() -> None:
+    """Drop the memoised store so the next get_memory_store() reopens it (closes the old one)."""
+    global _memory_store
+    with _memory_store_lock:
+        old, _memory_store = _memory_store, None
+    if old is not None:
+        try:
+            old.close()
+        except Exception:  # noqa: BLE001
+            pass

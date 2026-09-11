@@ -44,6 +44,7 @@ cp .env.example .env   # optional; every value has a default or a Secret Manager
 | `SLACK_SESSION_IDLE_MIN` | `120` - minutes of silence before a top-level mention/DM starts a new conversation |
 | `SLACK_SESSIONS_FILE` | `data/slack_sessions.json` - session bookkeeping (who is in which conversation) |
 | `SLACK_WEBHOOK_URL` | env only (never Secret Manager); legacy fallback for `--post-slack` |
+| `MEMORY_DB_URL` / `MEMORY_EPISODE_TTL_DAYS` / `MEMORY_EMBEDDINGS` | `sqlite:///data/memory.db` / `90` / `vertex` - long-term memory, see [Long-term memory](#long-term-memory) |
 
 `Config()` never touches GCP until an API key attribute is read; Vertex uses ADC (no API key).
 
@@ -70,7 +71,7 @@ Interactive chat agent (LangGraph ReAct over the signal tools):
 
 ```bash
 python chat.py
-# /tokens  list the universe    /reset  clear history    /quit
+# /tokens  list the universe    /reset  clear history (summarised into memory)    /memory  what is remembered    /quit
 python chat.py -q "Give me the BTC options snapshot: term structure, skew, put/call and biggest block trades"
 python chat.py -q "Is ETH implied vol unusually high vs its 30 day history?"   # uses dvol_close / atm_iv_30d z-scores
 ```
@@ -330,6 +331,163 @@ Tests: `tests/test_bigquery_provider.py` (guard, catalog cache with a fake clien
 describe formatting) and `tests/test_desk_tools.py` (every tool against canned frames
 modelled on real rows) - no GCP, no network.
 
+## Spot desk PnL (Google Sheet)
+
+The chat agent and the Slack bot can also read the spot desk's own PnL dashboard, the Google
+Sheet **"A1 Metrics Dashboard"** (id `1BksNxC2QXHLjFJNCuv-GC9JOBHeb8EyoGwzTuNwqNSY`, owner
+Joao Luis, maintained daily; each dashboard tab has a "Data as of" cell). It is the **booked
+PnL of the spot business** - **HOLD** (Anchorage's client spot trading; PnL = trading
+commissions on client trades, per the sheet's `hold db` feed) vs **A1** (A1 Ltd, the
+principal spot desk; weekly PnL split into realised and an "unrealized PNL approximation") -
+and therefore a different source from the Haruko mark-to-market PnL of the derivatives book in
+BigQuery. The tools and the prompt say which source a number came from. Implementation:
+`providers/gsheets.py` (`A1MetricsSheet`, `get_a1_metrics_sheet()` in `providers/factory.py`),
+`tools/sheet_tools.py` (`get_sheet_tools()`, registered after the desk tools by
+`chat.default_tools()`), prompt section "Spot desk PnL (A1 Metrics Dashboard sheet)".
+
+**Access.** Sheets REST API v4 called directly with `requests` (no Google API client library)
+using Application Default Credentials - the same user ADC as Vertex / BigQuery, but the token
+must carry the Sheets scope. Log in once with exactly these scopes:
+
+```bash
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive.file,https://www.googleapis.com/auth/presentations.readonly,https://www.googleapis.com/auth/spreadsheets.readonly,https://www.googleapis.com/auth/drive.readonly
+```
+
+Every request carries `x-goog-user-project: anchorage-corp-eng-playground` (the ADC quota
+project; `GSHEETS_QUOTA_PROJECT`). A 403 means the ADC token lacks `spreadsheets.readonly`
+(re-run the login above) or the account cannot view the sheet; a 404 means the sheet is not
+shared with the account - the tools relay both as plain messages. Google warns at login that
+`spreadsheets.readonly` / `drive.readonly` **will soon be blocked for gcloud's default OAuth
+client id**. Mitigations: (a) register your own OAuth client id and pass it with
+`gcloud auth application-default login --client-id-file=client_secret.json --scopes=...`;
+(b) for Cloud Run, use a service account - `gm-bot@anchorage-corp-eng-playground.iam.gserviceaccount.com`
+exists, but the sheet **cannot be shared with it** under the current Workspace domain policy,
+so it needs domain-wide delegation (impersonate a user with view access) or a policy exception.
+Nothing in this module writes to the sheet.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `A1_METRICS_SHEET_ID` | `1BksNxC2QXHLjFJNCuv-GC9JOBHeb8EyoGwzTuNwqNSY` | spreadsheet id |
+| `GSHEETS_QUOTA_PROJECT` | `anchorage-corp-eng-playground` | `x-goog-user-project` on every call |
+| `GSHEETS_CACHE_TTL_S` | `300` | in-process cache per range / tab list |
+
+**Tabs used** (layouts observed 2026-09-11; parsers locate header rows by content because the
+tabs are hand-built with merged group headers and blank spacer columns):
+
+| Tab | Layout | Tool |
+|---|---|---|
+| `Volume & PNL` (and `2025 Volume & PNL`) | row 1 `Data as of`; row 2 HOLD / A1 / TOTAL group labels; row 3 `Month | Volume | PNL | Take Rate` per group (TOTAL adds cumulative volume / PnL, target PnL, % of target); months 1-12; `Total YTD` row. Take rate is stored in bps | `get_spot_pnl_summary(year=None)` |
+| `Weekly PNL` | HOLD `Week | PNL`; A1 `Week | Realized PNL | Unrealized PNL Approximation | Total`; `A1 + HOLD` `Week | PNL | Start Date | End Date` (Fri-Thu weeks); `Total` row; future weeks are 0 and dropped | `get_weekly_spot_pnl(weeks=8)` |
+| `Financing Fees` | `Month | HOLD Financing Fees | HOLD Delta Sales | Total` + a weekly block; no as-of cell (the tool prints the dashboard's) | `get_financing_fees(months=6)` |
+| `Nonclient PNL` | only a title and a link to a separate "HOLD PNL" spreadsheet the agent cannot read | `get_nonclient_pnl(months=6)` (says so) |
+| `db` | trade blotter `Date (UTC) | Counterparty | Side | Symbol | Buy QTY | Buy Asset | Sell QTY | Sell Asset | Price | PNL | Currency | bps | Month` | `get_counterparty_pnl(days=30, top_n=15, counterparty=None, by="counterparty"|"symbol"|"side")` |
+| any | raw cells, capped at 200 rows x 30 columns | `list_a1_dashboard_tabs()`, `read_a1_dashboard_range(tab, a1_range)` |
+
+All tools print the tab's "Data as of" date and the source line, format USD with `$` and
+thousands separators and bps to two decimals.
+
+**Caveats.** The trade-level blotter (`db`) stops at **2024-12-31**; the fuller `Trades` tab
+ends 2025-05-22 and has no PnL column, `Dealer Trades` / `Exchange Trades` are broken
+`IMPORTRANGE`s and `Counterparty Trades` is a hand summary - so there is **no trade-level
+counterparty PnL for 2025-2026 in this sheet**. `get_counterparty_pnl` counts `days` back from
+the latest trade in the blotter and prints the coverage window with a caveat; current totals
+come from the monthly / weekly tabs. The Weekly and Monthly tabs are updated by hand and can
+differ slightly (2026 YTD: weekly total $13.93M vs monthly $13.62M on 2026-09-11 - the weekly
+A1 figure includes the unrealised approximation). Verified live 2026-09-11: `Total YTD` PnL
+cell `'Volume & PNL'!N16` = 13,622,125.72 = sum of the monthly TOTAL PnL cells = HOLD
+5,019,699.27 + A1 8,602,426.45, matching `get_spot_pnl_summary`.
+
+Tests: `tests/test_gsheets.py` (parsers on canned `values` payloads modelled on the real
+rows, auth headers, 401 refresh, 403 / 404 / 429 messages, cache TTL, factory) and
+`tests/test_sheet_tools.py` (every tool's markdown, unavailable / error paths, `by` variants,
+the range cap) - no network, no GCP.
+
+## Long-term memory
+
+The chat agent and the Slack bot share a small persistent memory (`providers/memory_store.py`,
+`tools/memory_tools.py`, `tools/context.py`), separate from the per-conversation checkpoints.
+
+**What is stored, where.** One SQLite file, `data/memory.db` by default (`MEMORY_DB_URL`,
+e.g. `sqlite:///data/memory.db`; `postgresql://...` is accepted for Cloud Run and needs
+`pip install 'psycopg[binary]'`, otherwise a clear `NotImplementedError`). Table `memories`
+(`id, namespace, key, text, meta JSON, created_at, updated_at, expires_at, embedding BLOB`) with
+four namespaces, plus the `snapshots` table used by `snapshot_daily.py` (see
+[Data snapshots](#data-snapshots)):
+
+| Namespace | Content | Written by | TTL |
+|---|---|---|---|
+| `facts:shared` | desk facts everyone should know ("take rate is quoted in bps", data quirks) | `remember(text, scope="shared")` | none |
+| `prefs:<slack_user_id>` | one user's preferences (units, format, tokens followed); terminal user is `local` | `remember(text, scope="me")` | none |
+| `rules:<channel_id>` | the channel's single standing instruction (replace on set) | `set_channel_rule(text)` / `clear_channel_rule()` - channels only, refused in DMs | none |
+| `episodes:<slack_user_id>` | 2-4 sentence summaries of past conversations (who asked, topics, numbers with as-of dates, follow-ups) | automatic, see below | `MEMORY_EPISODE_TTL_DAYS` (default 90; `purge_expired()`) |
+
+**Recall.** Before every turn `tools.memory_tools.build_context(user, channel, text)` searches
+`facts:shared` + `prefs:<user>` + `episodes:<user>` + `rules:<channel>` and renders at most ~1200
+chars as a `<memories>` block ("Standing instructions for this channel: ..." first, verbatim, then
+"Relevant memories (may be stale): ..."). The block is appended to the **system prompt of that model
+call only** (a langchain `dynamic_prompt` middleware in `chat.build_chat_agent` reads
+`tools.context.current_memory_context`), so the checkpointed messages stay clean and the
+episodic summaries never see recalled memories. Another user's preferences or episodes are never
+searched. Search is semantic when embeddings work (`langchain_google_vertexai.VertexAIEmbeddings`,
+`text-embedding-005`, project `anchorage-ai-development`, `us-central1`; vectors stored as float32
+bytes, cosine in Python) and degrades to BM25-style keyword scoring after one WARNING when the
+probe fails or `MEMORY_EMBEDDINGS=off`.
+
+**Identity.** Tools never receive a user id from the model: `slack_bot.handle` and `chat.ChatSession.ask`
+set the contextvars `tools.context.current_user_id / current_channel_id / current_is_dm` around the
+agent call (LangGraph copies the context into the tool and model nodes). In a DM `remember` defaults
+to `scope="me"` unless the text clearly asks for a shared/desk fact.
+
+**Tools** (`chat.default_tools()` registers them after the sheet tools): `remember`, `recall(query, k)`,
+`forget(query_or_id, scope)` (id or id prefix, matching text, or `"everything"` to wipe the user's
+prefs + episodes), `what_do_you_remember()` (the user's prefs and episodes with ids and dates, the
+shared-fact count, the channel rule - never other users' data), `set_channel_rule`, `clear_channel_rule`.
+Prompt rules (`prompts/chat_assistant_prompt.md`, "Long-term memory"; Slack addendum in
+`prompts/slack_prompt.md`): store durable facts and preferences only, never positions / PnL / prices
+/ client names / credentials; confirm what was stored or deleted. A regex guard refuses anything that
+looks like a token or key (Slack `xox*`, `sk-`, AWS, Google, GitHub, JWT, PEM, `password=`, long
+hex / base64 blobs) and warns - but stores - when the text mentions positions / PnL or a dollar amount
+above $1M.
+
+**Episodic memory.** The Slack bot summarises a session with `get_llm(max_tokens=300)` into
+`episodes:<user>` (meta: channel, session key, started, ended, replies) when the session closes -
+idle timeout detected on the next message, `reset`, or stale sessions found at start-up
+(`SessionStore.expire_stale`) - and after every 6th reply. Summaries run as background asyncio tasks
+(`slack_bot.spawn_episode`, `flush_background`), so replies are never delayed; failures are logged.
+`SessionStore` tracks how many replies of each session are already summarised
+(`episodes` in `data/slack_sessions.json`). The terminal chat summarises on `/reset` and `/quit`;
+`/memory` prints `what_do_you_remember`.
+
+**How to forget.** Say "forget <id or text>" (ids appear in `what_do_you_remember` / `recall`) or
+"forget everything about me" (deletes `prefs:<user>` and `episodes:<user>`; shared facts stay).
+Operators: `python -c "from providers.factory import get_memory_store as g; s=g(); print(s.delete_namespace('prefs:U123'))"`
+or delete `data/memory.db`.
+
+```bash
+python chat.py                                    # "remember that I prefer bps not percent" -> stored in prefs:local
+python chat.py -q "what do you remember about me?"
+python slack_bot.py --selftest "what do you remember about me?"   # identity USELFTEST / CSELFTEST
+```
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MEMORY_DB_URL` | `sqlite:///data/memory.db` | store location; `postgresql://` needs psycopg |
+| `MEMORY_EPISODE_TTL_DAYS` | `90` | episode expiry |
+| `MEMORY_EMBEDDINGS` | `vertex` | `vertex` (text-embedding-005 + keyword fallback) or `off` |
+| `MEMORY_EMBED_MODEL` / `MEMORY_EMBED_PROJECT` / `MEMORY_EMBED_LOCATION` | `text-embedding-005` / `anchorage-ai-development` / `us-central1` | embedding endpoint |
+
+**Cloud Run note.** The SQLite file lives on the instance's disk and is lost on redeploy (and not
+shared across instances); point `MEMORY_DB_URL` at Cloud SQL (`postgresql://...`, add `psycopg[binary]`
+to requirements) or mount a persistent volume. The service account needs `aiplatform.user` on
+`anchorage-ai-development` for embeddings; without it the store logs one warning and uses keyword search.
+
+Tests: `tests/test_memory_store.py` (put/search/list/delete/TTL, namespace isolation, keyword fallback,
+snapshot upsert idempotency and series, backend selection) and `tests/test_memory_tools.py` (every tool,
+DM scoping, channel-rule replace/clear and injection text, recall block cap, guard regexes, summariser
+with a fake LLM); `tests/test_chat.py` and `tests/test_slack_bot.py` cover the injection into the system
+prompt only, identity contextvars inside the graph, and episodes after the 6th reply / reset / idle
+timeout / start-up. No network, no Vertex.
+
 ## Known limitations
 
 - **Coin Metrics trial key**: `ReferenceRateUSD` returns 403 for every asset; `PriceUSD` is
@@ -349,6 +507,9 @@ modelled on real rows) - no GCP, no network.
 - **Slack**: `--post-slack` resolves the channel id / bot token secrets only when passed; the
   webhook is env-only. With neither configured it logs a warning, prints "skipped" and exits 0.
   The bot's thread memory is a local SQLite file; only one Socket Mode listener may run.
+- **Memory**: recall is best-effort (top 6 items, ~1200 chars) and the memories block is advisory -
+  the model may still ignore a preference. Episode summaries cost one small Vertex call per closed
+  session / 6 replies. Embeddings need Vertex access in `us-central1`; otherwise keyword search only.
 
 ## Architecture
 
@@ -362,9 +523,49 @@ run_signals.py / chat.py / slack_bot.py      entry points (CLI report, terminal 
          providers/factory.get_provider()     CompositeProvider(spot=CoinMetricsProvider, derivatives=AmberdataProvider)
          providers/factory.get_options_provider()  AmberdataOptionsProvider (Deribit) or None without a key
          providers/base.py                    standard schemas: time, price | spot_volume | funding_rate (annualized %) | perp_oi | ...
+       tools/memory_tools.py                  remember / recall / forget / channel rules + build_context, episode summariser
+       tools/context.py                       contextvars: current_user_id / current_channel_id / current_is_dm / current_memory_context
+         providers/factory.get_memory_store() MemoryStore (providers/memory_store.py): memories + snapshots in data/memory.db
   utils/llm.get_llm()                         ChatAnthropicVertex (cached per model/temperature/max_tokens)
   utils/config.Config + utils/secrets         env override -> GCP Secret Manager
   notifiers/slack                             to_mrkdwn / chunk_text, post_via_bot (bot token), post_message (env webhook)
   prompts/*.md                                system, per-token, whole-universe, chat and Slack-addendum prompts
   deploy/                                     Cloud Run notes, systemd units (not enabled)
 ```
+
+## Data snapshots
+
+`snapshot_daily.py` records one row per (date, source, entity, metric) into the `snapshots`
+table of the memory store (`providers/memory_store.py`, env `MEMORY_DB_URL`, default
+`sqlite:///data/memory.db`), so the chat agent and the Slack bot can answer "how has X moved
+since ..." questions from our own history instead of re-deriving it. Rows are upserted, so
+re-running for the same date is a no-op apart from `captured_at`.
+
+```bash
+python snapshot_daily.py                          # all three sources for today's UTC date
+python snapshot_daily.py --sources haruko,sheet   # subset
+python snapshot_daily.py --date 2026-09-10        # store under another date (values are still "now")
+python snapshot_daily.py --dry-run -v             # print every row, write nothing
+```
+
+Exit code is non-zero only when every requested source fails; one failing source never blocks
+the others. Each source logs its row count, upstream call count and duration.
+
+| Source | Entities | Metrics |
+|---|---|---|
+| `haruko` - latest `fct_otc_haruko_pnl_portfolio` row per entity (same query shape as `get_desk_risk_snapshot`) | `20` (A1 Ltd), `86` (ADSD), `combined` (sum) | `delta_usd`, `delta_adjusted_usd`, `gamma_usd`, `gamma_pct_usd`, `vega`, `theta`, `day_pnl`, `ytd_pnl`, `gross_notional`, `equity`, `valid_pricer_pct` (combined = pricer-count weighted), `data_quality_flag` (value 1 = Normal / 0 = flagged; `value_json` carries the flag text and as-of time) |
+| `signals` - `fetch_token_metrics(FULL_TOKEN_UNIVERSE, 45 days)` -> `calculate_statistical_signals` | one per token (`btc`, `eth`, ...) | `<m>` (latest value) and `<m>_z` (z-score) for `spot_volume`, `perp_volume`, `perp_oi`, `total_liquidations` and, where listed, `dvol_close`, `atm_iv_30d`, `pcr_oi`, `options_notional_volume`, `options_block_notional_volume`; `skew_25d_30d` / `pcr_volume_24h` plus `_chg7d`; `price`, `price_pct_change_1d`, `funding_rate` (annualised %). Values are as of the last complete UTC day (`value_json.as_of`). |
+| `sheet` - A1 Metrics Dashboard (`monthly_volume_pnl`, `weekly_pnl`) | `HOLD`, `A1`, `TOTAL` | `mtd_volume_usd`, `mtd_pnl_usd`, `mtd_take_rate_bps` (latest populated month <= current), `ytd_volume_usd`, `ytd_pnl_usd`, `ytd_take_rate_bps`, `ytd_target_pnl_usd` / `ytd_pct_of_target` (TOTAL), `week_pnl_usd` (latest week), `week_realized_pnl_usd` / `week_unrealized_pnl_usd` (A1) |
+
+Chat tools (`tools/snapshot_tools.py`, read-only, registered through `chat.default_tools()`):
+
+- `get_snapshot_history(source, metric, entity=None, days=30)` - date | value table with first -> last
+  change and min / max. Default entity: `combined` (haruko), `TOTAL` (sheet); `signals` needs the token.
+  Haruko entity aliases: `a1` -> `20`, `adsd` -> `86`.
+- `compare_to_snapshot(source, metric, entity, date)` - latest vs the snapshot on that date (falls back to
+  the closest earlier one, up to 31 days, and says so).
+- `list_snapshot_metrics(source="")` - captured entities / metrics and the latest snapshot date per source.
+
+Schedule: `deploy/trading-signals-snapshot.service` + `.timer` run it at 23:30 UTC daily (not enabled;
+install like the daily-post timer in `deploy/cloud-run.md`). Haruko's own EOD row lands at ~23:55 UTC, so
+the snapshot holds the latest intraday portfolio row of the day. First live run 2026-09-11.

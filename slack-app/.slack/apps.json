@@ -1,0 +1,11 @@
+{
+  "apps": {
+    "E07K5KW2X54": {
+      "app_id": "A0BUDP820G6",
+      "enterprise_id": "E07K5KW2X54",
+      "team_domain": "anchorage",
+      "team_id": "E07K5KW2X54"
+    }
+  },
+  "default": "anchorage"
+}

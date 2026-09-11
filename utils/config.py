@@ -26,6 +26,16 @@ BQ_MAX_BYTES_BILLED   env BQ_MAX_BYTES_BILLED  (default 2_000_000_000 = 2 GB per
 BQ_MAX_ROWS           env BQ_MAX_ROWS          (default 200; LIMIT enforced on every query)
 BQ_TIMEOUT_S          env BQ_TIMEOUT_S         (default 60)
 BQ_CATALOG_PATH       env BQ_CATALOG_PATH      (default data/bq_catalog.json; 24 h table-metadata cache)
+
+Long-term memory + daily snapshots (providers/memory_store.py):
+MEMORY_DB_URL         env MEMORY_DB_URL        (default sqlite:///data/memory.db; postgresql://... needs psycopg)
+MEMORY_EPISODE_TTL_DAYS env MEMORY_EPISODE_TTL_DAYS (default 90; conversation summaries expire)
+MEMORY_EMBEDDINGS     env MEMORY_EMBEDDINGS    (default vertex = text-embedding-005 with keyword fallback; off = keyword only)
+
+Spot desk PnL in the "A1 Metrics Dashboard" Google Sheet (providers/gsheets.py, read-only):
+A1_METRICS_SHEET_ID   env A1_METRICS_SHEET_ID  (default 1BksNxC2QXHLjFJNCuv-GC9JOBHeb8EyoGwzTuNwqNSY)
+GSHEETS_QUOTA_PROJECT env GSHEETS_QUOTA_PROJECT (default anchorage-corp-eng-playground; x-goog-user-project)
+GSHEETS_CACHE_TTL_S   env GSHEETS_CACHE_TTL_S  (default 300; in-process cache per range)
 """
 
 from __future__ import annotations
@@ -58,6 +68,18 @@ DEFAULT_BQ_MAX_BYTES_BILLED = 2_000_000_000
 DEFAULT_BQ_MAX_ROWS = 200
 DEFAULT_BQ_TIMEOUT_S = 60
 DEFAULT_BQ_CATALOG_PATH = "data/bq_catalog.json"
+
+# Long-term memory + daily snapshots (providers/memory_store.py)
+DEFAULT_MEMORY_DB_URL = "sqlite:///data/memory.db"
+DEFAULT_MEMORY_EPISODE_TTL_DAYS = 90
+DEFAULT_MEMORY_EMBEDDINGS = "vertex"
+
+# Spot desk PnL sheet ("A1 Metrics Dashboard", maintained daily by the desk). Read
+# with Application Default Credentials (user account, spreadsheets.readonly scope);
+# API calls carry x-goog-user-project so quota is charged to the ADC quota project.
+DEFAULT_A1_METRICS_SHEET_ID = "1BksNxC2QXHLjFJNCuv-GC9JOBHeb8EyoGwzTuNwqNSY"
+DEFAULT_GSHEETS_QUOTA_PROJECT = "anchorage-corp-eng-playground"
+DEFAULT_GSHEETS_CACHE_TTL_S = 300
 
 # Secret Manager names (project DEFAULT_SECRETS_PROJECT)
 SECRET_COINMETRICS = "coinmetrics_trial_api"
@@ -100,6 +122,16 @@ class Config:
         self.BQ_MAX_ROWS = _int_env("BQ_MAX_ROWS", DEFAULT_BQ_MAX_ROWS)
         self.BQ_TIMEOUT_S = _int_env("BQ_TIMEOUT_S", DEFAULT_BQ_TIMEOUT_S)
         self.BQ_CATALOG_PATH = os.getenv("BQ_CATALOG_PATH", DEFAULT_BQ_CATALOG_PATH)
+
+        # Long-term memory + snapshots (see providers/memory_store.py)
+        self.MEMORY_DB_URL = os.getenv("MEMORY_DB_URL", DEFAULT_MEMORY_DB_URL)
+        self.MEMORY_EPISODE_TTL_DAYS = _int_env("MEMORY_EPISODE_TTL_DAYS", DEFAULT_MEMORY_EPISODE_TTL_DAYS)
+        self.MEMORY_EMBEDDINGS = os.getenv("MEMORY_EMBEDDINGS", DEFAULT_MEMORY_EMBEDDINGS)
+
+        # Spot desk PnL Google Sheet (read-only; see providers/gsheets.py)
+        self.A1_METRICS_SHEET_ID = os.getenv("A1_METRICS_SHEET_ID", DEFAULT_A1_METRICS_SHEET_ID)
+        self.GSHEETS_QUOTA_PROJECT = os.getenv("GSHEETS_QUOTA_PROJECT", DEFAULT_GSHEETS_QUOTA_PROJECT)
+        self.GSHEETS_CACHE_TTL_S = _int_env("GSHEETS_CACHE_TTL_S", DEFAULT_GSHEETS_CACHE_TTL_S)
 
     # ------------------------------------------------------------------
     # Secrets (env override, then Secret Manager; resolved lazily, cached)

@@ -1,0 +1,735 @@
+"""Persistent memory + daily data snapshots for the chat agent and the Slack bot.
+
+One small SQLite database (default ``data/memory.db``; env ``MEMORY_DB_URL``) with two
+tables and a tiny DAO. No LangGraph store classes, no ORM.
+
+    memories(id TEXT PK, namespace, key, text, meta JSON, created_at, updated_at,
+             expires_at NULL, embedding BLOB NULL)
+        namespaces: facts:shared | prefs:<slack_user_id> | rules:<channel_id> | episodes:<slack_user_id>
+    snapshots(snapshot_date DATE, source, entity, metric, value REAL, value_json TEXT, captured_at,
+              PRIMARY KEY (snapshot_date, source, entity, metric))
+        sources: haruko | signals | sheet (see snapshot_daily.py)
+
+Search is semantic when an embedder is available (Vertex ``text-embedding-005`` by default,
+embeddings kept as float32 bytes, cosine similarity in Python - the tables are small) and
+falls back to keyword (BM25-ish) scoring when embeddings fail or are disabled
+(``MEMORY_EMBEDDINGS=off``). Rules namespaces are always returned unfiltered.
+
+Backends: ``sqlite:///path`` (default, fully supported) or ``postgresql://...`` (Cloud Run;
+the same SQL through psycopg - needs ``pip install psycopg[binary]``, otherwise a clear
+NotImplementedError is raised).
+
+Thread-safe: every statement runs under one lock on a single connection (the agent runs tool
+calls in threads and the Slack bot summarises sessions in background tasks).
+"""
+
+from __future__ import annotations
+
+import array
+import json
+import logging
+import math
+import os
+import re
+import sqlite3
+import threading
+import uuid
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional, Sequence
+
+from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+DEFAULT_DB_URL = "sqlite:///data/memory.db"
+DEFAULT_EMBED_MODEL = "text-embedding-005"
+DEFAULT_EMBED_PROJECT = "anchorage-ai-development"
+DEFAULT_EMBED_LOCATION = "us-central1"
+DEFAULT_EPISODE_TTL_DAYS = 90
+
+SHARED_FACTS = "facts:shared"
+
+
+def prefs_namespace(user_id: str) -> str:
+    return f"prefs:{user_id}"
+
+
+def rules_namespace(channel_id: str) -> str:
+    return f"rules:{channel_id}"
+
+
+def episodes_namespace(user_id: str) -> str:
+    return f"episodes:{user_id}"
+
+
+def episode_ttl_days() -> int:
+    raw = os.getenv("MEMORY_EPISODE_TTL_DAYS", "")
+    try:
+        return int(raw) if raw.strip() else DEFAULT_EPISODE_TTL_DAYS
+    except ValueError:
+        logger.warning("Ignoring non-integer MEMORY_EPISODE_TTL_DAYS=%r", raw)
+        return DEFAULT_EPISODE_TTL_DAYS
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.replace(microsecond=0).isoformat(sep=" ")
+
+
+def _parse_dt(s) -> Optional[datetime]:
+    if s is None:
+        return None
+    if isinstance(s, datetime):
+        return s
+    try:
+        return datetime.fromisoformat(str(s))
+    except ValueError:
+        return None
+
+
+def _to_date(d) -> date:
+    if isinstance(d, datetime):
+        return d.date()
+    if isinstance(d, date):
+        return d
+    return date.fromisoformat(str(d)[:10])
+
+
+# ---------------------------------------------------------------------------
+# Embedders
+# ---------------------------------------------------------------------------
+
+class HashEmbedder:
+    """Deterministic, network-free embedder for tests: bag-of-words hashed into ``dim`` buckets."""
+
+    def __init__(self, dim: int = 64):
+        self.dim = dim
+        self.available = True
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        out = []
+        for text in texts:
+            vec = [0.0] * self.dim
+            for tok in _tokenize(text):
+                h = 0
+                for ch in tok:
+                    h = (h * 131 + ord(ch)) % (2 ** 31)
+                vec[h % self.dim] += 1.0
+            out.append(vec)
+        return out
+
+
+class VertexEmbedder:
+    """Lazy ``langchain_google_vertexai.VertexAIEmbeddings``; verified live once, then either
+    used or permanently disabled (``available`` False) with a single WARNING."""
+
+    def __init__(self, model: str | None = None, project: str | None = None, location: str | None = None):
+        self.model = model or os.getenv("MEMORY_EMBED_MODEL") or DEFAULT_EMBED_MODEL
+        self.project = project or os.getenv("MEMORY_EMBED_PROJECT") or os.getenv("VERTEX_PROJECT") or DEFAULT_EMBED_PROJECT
+        self.location = location or os.getenv("MEMORY_EMBED_LOCATION") or DEFAULT_EMBED_LOCATION
+        self._client = None
+        self._checked = False
+        self.available = True
+        self._lock = threading.Lock()
+
+    def _ensure(self) -> bool:
+        if self._checked:
+            return self.available
+        with self._lock:
+            if self._checked:
+                return self.available
+            try:
+                import warnings
+
+                from langchain_google_vertexai import VertexAIEmbeddings
+
+                with warnings.catch_warnings():
+                    # langchain-google-vertexai 3.2 deprecates this class in favour of the GenAI package;
+                    # text-embedding-005 on Vertex still needs it.
+                    warnings.simplefilter("ignore")
+                    client = VertexAIEmbeddings(model_name=self.model, project=self.project, location=self.location)
+                probe = client.embed_query("memory store probe")
+                if not probe or not isinstance(probe[0], float):
+                    raise RuntimeError("empty embedding returned")
+                self._client = client
+                self.available = True
+                logger.info("Memory embeddings: Vertex %s (%s/%s, dim %d)", self.model, self.project,
+                            self.location, len(probe))
+            except Exception as e:  # noqa: BLE001 - any failure -> keyword search
+                self.available = False
+                logger.warning("Memory embeddings unavailable (%s: %s); falling back to keyword search",
+                               type(e).__name__, str(e).splitlines()[0][:200])
+            self._checked = True
+            return self.available
+
+    def embed(self, texts: Sequence[str]) -> Optional[list[list[float]]]:
+        if not self._ensure():
+            return None
+        try:
+            return self._client.embed_documents(list(texts))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Embedding call failed (%s); using keyword search for this call", e)
+            return None
+
+
+def default_embedder():
+    """VertexEmbedder unless ``MEMORY_EMBEDDINGS`` is off/0/false/keyword."""
+    mode = os.getenv("MEMORY_EMBEDDINGS", "vertex").strip().lower()
+    if mode in ("off", "0", "false", "no", "none", "keyword"):
+        return None
+    return VertexEmbedder()
+
+
+def _pack(vec: Sequence[float]) -> bytes:
+    return array.array("f", [float(x) for x in vec]).tobytes()
+
+
+def _unpack(blob) -> Optional[list[float]]:
+    if not blob:
+        return None
+    a = array.array("f")
+    a.frombytes(bytes(blob))
+    return list(a)
+
+
+def cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+# ---------------------------------------------------------------------------
+# Keyword scoring (BM25-ish; documents are a few hundred rows at most)
+# ---------------------------------------------------------------------------
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+(?:[.'][a-z0-9]+)*")
+_STOP = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are", "be", "i", "me", "my",
+         "we", "you", "it", "that", "this", "with", "as", "at", "by", "do", "does", "what", "which", "how",
+         "please", "about", "remember", "not", "no", "than", "from", "was", "were", "have", "has"}
+
+
+def _tokenize(text: str) -> list[str]:
+    return [t for t in _TOKEN_RE.findall((text or "").lower()) if t not in _STOP]
+
+
+def keyword_scores(query: str, docs: Sequence[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
+    """BM25 over ``docs`` for ``query``; scores normalised to [0, 1] by the best hit."""
+    q = _tokenize(query)
+    if not q or not docs:
+        return [0.0] * len(docs)
+    toks = [_tokenize(d) for d in docs]
+    n = len(docs)
+    avgdl = max(1.0, sum(len(t) for t in toks) / n)
+    df: dict[str, int] = {}
+    for t in toks:
+        for term in set(t):
+            df[term] = df.get(term, 0) + 1
+    scores = []
+    for t in toks:
+        s = 0.0
+        if t:
+            counts: dict[str, int] = {}
+            for term in t:
+                counts[term] = counts.get(term, 0) + 1
+            for term in q:
+                # prefix match so "bps" hits "bps" and "prefer" hits "prefers"
+                tf = sum(c for w, c in counts.items() if w == term or (len(term) >= 4 and w.startswith(term)))
+                if not tf:
+                    continue
+                d = df.get(term, 0) or 1
+                idf = math.log(1 + (n - d + 0.5) / (d + 0.5))
+                s += idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * len(t) / avgdl))
+        scores.append(s)
+    top = max(scores) if scores else 0.0
+    return [s / top if top > 0 else 0.0 for s in scores]
+
+
+# ---------------------------------------------------------------------------
+# Rows
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Memory:
+    id: str
+    namespace: str
+    key: Optional[str]
+    text: str
+    meta: dict = field(default_factory=dict)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    score: float = 0.0
+
+    @property
+    def kind(self) -> str:
+        return self.namespace.split(":", 1)[0]
+
+    @property
+    def owner(self) -> str:
+        return self.namespace.split(":", 1)[1] if ":" in self.namespace else ""
+
+    def short_id(self) -> str:
+        return self.id[:8]
+
+    def as_dict(self) -> dict:
+        return {"id": self.id, "namespace": self.namespace, "key": self.key, "text": self.text,
+                "meta": self.meta, "created_at": _iso(self.created_at) if self.created_at else None,
+                "updated_at": _iso(self.updated_at) if self.updated_at else None,
+                "expires_at": _iso(self.expires_at) if self.expires_at else None, "score": round(self.score, 3)}
+
+
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+
+_SQLITE_DDL = [
+    """CREATE TABLE IF NOT EXISTS memories (
+        id TEXT PRIMARY KEY,
+        namespace TEXT NOT NULL,
+        key TEXT,
+        text TEXT NOT NULL,
+        meta TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT,
+        embedding BLOB
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_memories_ns ON memories(namespace)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_ns_key ON memories(namespace, key)",
+    """CREATE TABLE IF NOT EXISTS snapshots (
+        snapshot_date TEXT NOT NULL,
+        source TEXT NOT NULL,
+        entity TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        value REAL,
+        value_json TEXT,
+        captured_at TEXT NOT NULL,
+        PRIMARY KEY (snapshot_date, source, entity, metric)
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_snapshots_series ON snapshots(source, entity, metric, snapshot_date)",
+]
+
+_PG_DDL = [
+    """CREATE TABLE IF NOT EXISTS memories (
+        id TEXT PRIMARY KEY,
+        namespace TEXT NOT NULL,
+        key TEXT,
+        text TEXT NOT NULL,
+        meta TEXT,
+        created_at TIMESTAMP NOT NULL,
+        updated_at TIMESTAMP NOT NULL,
+        expires_at TIMESTAMP,
+        embedding BYTEA
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_memories_ns ON memories(namespace)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_ns_key ON memories(namespace, key)",
+    """CREATE TABLE IF NOT EXISTS snapshots (
+        snapshot_date DATE NOT NULL,
+        source TEXT NOT NULL,
+        entity TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        value DOUBLE PRECISION,
+        value_json TEXT,
+        captured_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (snapshot_date, source, entity, metric)
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_snapshots_series ON snapshots(source, entity, metric, snapshot_date)",
+]
+
+
+class _Backend:
+    """Minimal DB-API wrapper: one connection, one lock, ``?`` placeholders."""
+
+    paramstyle_qmark = True
+
+    def __init__(self, conn, ddl: Iterable[str]):
+        self.conn = conn
+        self.lock = threading.RLock()
+        with self.lock:
+            for stmt in ddl:
+                self.conn.execute(stmt)
+            self.conn.commit()
+
+    def _sql(self, sql: str) -> str:
+        return sql if self.paramstyle_qmark else sql.replace("?", "%s")
+
+    def execute(self, sql: str, params: Sequence = ()) -> None:
+        with self.lock:
+            self.conn.execute(self._sql(sql), tuple(params))
+            self.conn.commit()
+
+    def executemany(self, sql: str, rows: Iterable[Sequence]) -> None:
+        with self.lock:
+            self.conn.executemany(self._sql(sql), [tuple(r) for r in rows])
+            self.conn.commit()
+
+    def fetchall(self, sql: str, params: Sequence = ()) -> list[tuple]:
+        with self.lock:
+            cur = self.conn.execute(self._sql(sql), tuple(params))
+            return [tuple(r) for r in cur.fetchall()]
+
+    def rowcount_execute(self, sql: str, params: Sequence = ()) -> int:
+        with self.lock:
+            cur = self.conn.execute(self._sql(sql), tuple(params))
+            self.conn.commit()
+            return cur.rowcount if cur.rowcount is not None else 0
+
+    def close(self) -> None:
+        with self.lock:
+            try:
+                self.conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+class _SqliteBackend(_Backend):
+    def __init__(self, path: str):
+        if path not in (":memory:", ""):
+            Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path or ":memory:", check_same_thread=False, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL") if path not in (":memory:", "") else None
+        conn.execute("PRAGMA busy_timeout=5000")
+        super().__init__(conn, _SQLITE_DDL)
+
+
+class _PostgresBackend(_Backend):
+    paramstyle_qmark = False
+
+    def __init__(self, url: str):
+        try:
+            import psycopg  # type: ignore
+        except ImportError as e:
+            raise NotImplementedError(
+                "MEMORY_DB_URL points at PostgreSQL but the 'psycopg' driver is not installed. "
+                "Run `pip install 'psycopg[binary]'` (Cloud Run: add it to requirements.txt), "
+                "or use the default sqlite:///data/memory.db."
+            ) from e
+        conn = psycopg.connect(url, autocommit=True)
+        super().__init__(conn, _PG_DDL)
+
+
+def _open_backend(url: str) -> _Backend:
+    url = (url or DEFAULT_DB_URL).strip()
+    if url.startswith("sqlite:///"):
+        return _SqliteBackend(url[len("sqlite:///"):])
+    if url.startswith("sqlite://"):
+        return _SqliteBackend(url[len("sqlite://"):] or ":memory:")
+    if url.startswith(("postgresql://", "postgres://")):
+        return _PostgresBackend(url)
+    if "://" not in url:  # bare path
+        return _SqliteBackend(url)
+    raise NotImplementedError(f"Unsupported MEMORY_DB_URL scheme: {url.split('://', 1)[0]!r} "
+                              "(use sqlite:///path or postgresql://...)")
+
+
+# ---------------------------------------------------------------------------
+# Store
+# ---------------------------------------------------------------------------
+
+class MemoryStore:
+    """Long-term memories (facts / prefs / rules / episodes) + daily snapshots.
+
+    ``embedder``: object with ``embed(texts) -> list[vec] | None`` and an ``available`` flag.
+    ``"auto"`` (default) picks :func:`default_embedder`; ``None`` disables embeddings (keyword search).
+    """
+
+    def __init__(self, url: str | None = None, embedder: Any = "auto"):
+        self.url = url or os.getenv("MEMORY_DB_URL") or DEFAULT_DB_URL
+        self._db = _open_backend(self.url)
+        self._embedder = default_embedder() if embedder == "auto" else embedder
+        self._search_lock = threading.Lock()
+        logger.info("Memory store: %s (embeddings: %s)", self.url,
+                    "keyword only" if self._embedder is None else type(self._embedder).__name__)
+
+    # -- embeddings ------------------------------------------------------
+
+    @property
+    def embeddings_enabled(self) -> bool:
+        return self._embedder is not None and getattr(self._embedder, "available", True)
+
+    def _embed(self, texts: Sequence[str]) -> Optional[list[list[float]]]:
+        if self._embedder is None:
+            return None
+        try:
+            vecs = self._embedder.embed(texts)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Embedder failed (%s); keyword search only for this call", e)
+            return None
+        if not vecs or len(vecs) != len(texts):
+            return None
+        return vecs
+
+    # -- memories: write -------------------------------------------------
+
+    def put(self, namespace: str, text: str, meta: dict | None = None, key: str | None = None,
+            ttl_days: int | float | None = None) -> str:
+        """Insert (or replace, when ``key`` is given and exists in the namespace). Returns the id."""
+        if not namespace or ":" not in namespace:
+            raise ValueError(f"namespace must look like 'kind:owner', got {namespace!r}")
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("memory text is empty")
+        now = _utcnow()
+        expires = _iso(now + timedelta(days=float(ttl_days))) if ttl_days else None
+        vecs = self._embed([text])
+        blob = _pack(vecs[0]) if vecs else None
+        meta_json = json.dumps(meta or {}, default=str)
+
+        existing = None
+        if key is not None:
+            rows = self._db.fetchall("SELECT id, created_at FROM memories WHERE namespace = ? AND key = ?",
+                                     (namespace, key))
+            existing = rows[0] if rows else None
+        if existing:
+            mem_id = existing[0]
+            self._db.execute(
+                "UPDATE memories SET text = ?, meta = ?, updated_at = ?, expires_at = ?, embedding = ? WHERE id = ?",
+                (text, meta_json, _iso(now), expires, blob, mem_id))
+        else:
+            mem_id = uuid.uuid4().hex
+            self._db.execute(
+                "INSERT INTO memories (id, namespace, key, text, meta, created_at, updated_at, expires_at, embedding) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mem_id, namespace, key, text, meta_json, _iso(now), _iso(now), expires, blob))
+        return mem_id
+
+    def delete(self, mem_id: str) -> bool:
+        """Delete by full id or unique prefix (>= 6 chars). True when a row went away."""
+        if not mem_id:
+            return False
+        rows = self._db.fetchall("SELECT id FROM memories WHERE id = ?", (mem_id,))
+        if not rows and len(mem_id) >= 6:
+            rows = self._db.fetchall("SELECT id FROM memories WHERE id LIKE ?", (mem_id + "%",))
+            if len(rows) != 1:
+                return False
+        if not rows:
+            return False
+        return self._db.rowcount_execute("DELETE FROM memories WHERE id = ?", (rows[0][0],)) > 0
+
+    def delete_namespace(self, namespace: str) -> int:
+        return self._db.rowcount_execute("DELETE FROM memories WHERE namespace = ?", (namespace,))
+
+    def purge_expired(self, now: datetime | None = None) -> int:
+        now = now or _utcnow()
+        return self._db.rowcount_execute("DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                                         (_iso(now),))
+
+    # -- memories: read --------------------------------------------------
+
+    def _row(self, r: tuple, with_embedding: bool = False):
+        mem = Memory(id=r[0], namespace=r[1], key=r[2], text=r[3], meta=_loads(r[4]),
+                     created_at=_parse_dt(r[5]), updated_at=_parse_dt(r[6]), expires_at=_parse_dt(r[7]))
+        return (mem, _unpack(r[8])) if with_embedding else mem
+
+    _COLS = "id, namespace, key, text, meta, created_at, updated_at, expires_at, embedding"
+
+    def get(self, mem_id: str) -> Optional[Memory]:
+        rows = self._db.fetchall(f"SELECT {self._COLS} FROM memories WHERE id = ?", (mem_id,))
+        if not rows and len(mem_id or "") >= 6:
+            rows = self._db.fetchall(f"SELECT {self._COLS} FROM memories WHERE id LIKE ?", (mem_id + "%",))
+            if len(rows) != 1:
+                return None
+        return self._row(rows[0]) if rows else None
+
+    def list(self, namespace: str, include_expired: bool = False) -> list[Memory]:
+        rows = self._db.fetchall(
+            f"SELECT {self._COLS} FROM memories WHERE namespace = ? ORDER BY updated_at DESC, created_at DESC",
+            (namespace,))
+        out = [self._row(r) for r in rows]
+        if not include_expired:
+            now = _utcnow()
+            out = [m for m in out if m.expires_at is None or m.expires_at > now]
+        return out
+
+    def count(self, namespace: str) -> int:
+        return len(self.list(namespace))
+
+    def search(self, namespaces: Sequence[str] | str, query: str, k: int = 6,
+               min_score: float = 0.05) -> list[Memory]:
+        """Top-``k`` memories across ``namespaces`` for ``query`` (semantic when embeddings exist for
+        both sides, else keyword). Rules namespaces (``rules:*``) are always returned in full,
+        first, regardless of the query. Expired rows are skipped."""
+        if isinstance(namespaces, str):
+            namespaces = [namespaces]
+        namespaces = [ns for ns in dict.fromkeys(namespaces) if ns]
+        if not namespaces:
+            return []
+        marks = ",".join("?" for _ in namespaces)
+        rows = self._db.fetchall(
+            f"SELECT {self._COLS} FROM memories WHERE namespace IN ({marks}) ORDER BY updated_at DESC",
+            tuple(namespaces))
+        now = _utcnow()
+        items = [self._row(r, with_embedding=True) for r in rows]
+        items = [(m, e) for m, e in items if m.expires_at is None or m.expires_at > now]
+
+        rules = [m for m, _ in items if m.kind == "rules"]
+        for m in rules:
+            m.score = 1.0
+        cands = [(m, e) for m, e in items if m.kind != "rules"]
+        if not cands or k <= 0:
+            return rules
+
+        query = (query or "").strip()
+        if not query:
+            ranked = cands[:k]
+            return rules + [m for m, _ in ranked]
+
+        kw = keyword_scores(query, [m.text for m, _ in cands])
+        qvec = None
+        if self.embeddings_enabled and any(e for _, e in cands):
+            q = self._embed([query])
+            qvec = q[0] if q else None
+
+        scored = []
+        for (m, emb), kscore in zip(cands, kw):
+            if qvec is not None and emb is not None and len(emb) == len(qvec):
+                sem = cosine(qvec, emb)
+                # semantic dominates; keyword adds a little precision for exact terms
+                score = 0.8 * max(sem, 0.0) + 0.2 * kscore
+            else:
+                score = kscore
+            m.score = score
+            scored.append(m)
+        scored.sort(key=lambda m: (m.score, m.updated_at or datetime.min), reverse=True)
+        keep = [m for m in scored if m.score >= min_score][:k]
+        return rules + keep
+
+    # -- snapshots -------------------------------------------------------
+
+    def put_snapshot(self, snapshot_date, source: str, entity: str, metric: str, value,
+                     value_json=None, captured_at: datetime | None = None) -> None:
+        """Upsert one (date, source, entity, metric) cell. ``value`` float-able or None;
+        ``value_json`` a JSON string or any JSON-serialisable object (dict/list) or None."""
+        d = _to_date(snapshot_date).isoformat()
+        v = None
+        if value is not None:
+            try:
+                v = float(value)
+                if math.isnan(v) or math.isinf(v):
+                    v = None
+            except (TypeError, ValueError):
+                v = None
+        vj = None
+        if value_json is not None:
+            vj = value_json if isinstance(value_json, str) else json.dumps(value_json, default=str)
+        cap = _iso(captured_at or _utcnow())
+        self._db.execute(
+            "INSERT INTO snapshots (snapshot_date, source, entity, metric, value, value_json, captured_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (snapshot_date, source, entity, metric) DO UPDATE SET "
+            "value = excluded.value, value_json = excluded.value_json, captured_at = excluded.captured_at",
+            (d, source, str(entity), metric, v, vj, cap))
+
+    def put_snapshots(self, rows: Iterable[dict]) -> int:
+        """Bulk upsert; each row: {snapshot_date, source, entity, metric, value, value_json?}. Returns count."""
+        n = 0
+        for r in rows:
+            self.put_snapshot(r["snapshot_date"], r["source"], r["entity"], r["metric"], r.get("value"),
+                              r.get("value_json"))
+            n += 1
+        return n
+
+    def get_snapshot(self, snapshot_date, source: str, entity: str, metric: str) -> Optional[dict]:
+        """One cell as {snapshot_date: date, value, value_json (parsed), captured_at} or None."""
+        d = _to_date(snapshot_date).isoformat()
+        rows = self._db.fetchall(
+            "SELECT snapshot_date, value, value_json, captured_at FROM snapshots "
+            "WHERE snapshot_date = ? AND source = ? AND entity = ? AND metric = ?",
+            (d, source, str(entity), metric))
+        return self._snap_row(rows[0]) if rows else None
+
+    def get_snapshot_series(self, source: str, entity: str, metric: str, days: int | None = 30,
+                            end: date | None = None) -> list[dict]:
+        """Daily points ascending: [{snapshot_date: date, value: float|None, value_json: obj|None,
+        captured_at: str}]. ``days`` counts back from ``end`` (default today UTC); None = all."""
+        params: list = [source, str(entity), metric]
+        sql = ("SELECT snapshot_date, value, value_json, captured_at FROM snapshots "
+               "WHERE source = ? AND entity = ? AND metric = ?")
+        if days is not None:
+            end_d = end or datetime.now(timezone.utc).date()
+            start = end_d - timedelta(days=int(days) - 1)
+            sql += " AND snapshot_date >= ? AND snapshot_date <= ?"
+            params += [start.isoformat(), end_d.isoformat()]
+        sql += " ORDER BY snapshot_date ASC"
+        return [self._snap_row(r) for r in self._db.fetchall(sql, params)]
+
+    def latest_snapshot_date(self, source: str, entity: str | None = None, metric: str | None = None) -> Optional[date]:
+        sql = "SELECT MAX(snapshot_date) FROM snapshots WHERE source = ?"
+        params: list = [source]
+        if entity is not None:
+            sql += " AND entity = ?"
+            params.append(str(entity))
+        if metric is not None:
+            sql += " AND metric = ?"
+            params.append(metric)
+        rows = self._db.fetchall(sql, params)
+        return _to_date(rows[0][0]) if rows and rows[0][0] else None
+
+    def list_snapshot_metrics(self, source: str, entity: str | None = None) -> list[dict]:
+        """[{entity, metric, first_date, last_date, n}] sorted by entity, metric."""
+        sql = ("SELECT entity, metric, MIN(snapshot_date), MAX(snapshot_date), COUNT(*) FROM snapshots "
+               "WHERE source = ?")
+        params: list = [source]
+        if entity is not None:
+            sql += " AND entity = ?"
+            params.append(str(entity))
+        sql += " GROUP BY entity, metric ORDER BY entity, metric"
+        return [{"entity": r[0], "metric": r[1], "first_date": _to_date(r[2]), "last_date": _to_date(r[3]),
+                 "n": int(r[4])} for r in self._db.fetchall(sql, params)]
+
+    def list_snapshot_entities(self, source: str) -> list[str]:
+        return [r[0] for r in self._db.fetchall(
+            "SELECT DISTINCT entity FROM snapshots WHERE source = ? ORDER BY entity", (source,))]
+
+    def list_snapshot_sources(self) -> list[str]:
+        return [r[0] for r in self._db.fetchall("SELECT DISTINCT source FROM snapshots ORDER BY source")]
+
+    def count_snapshots(self, source: str | None = None, snapshot_date=None) -> int:
+        sql, params = "SELECT COUNT(*) FROM snapshots WHERE 1 = 1", []
+        if source is not None:
+            sql += " AND source = ?"
+            params.append(source)
+        if snapshot_date is not None:
+            sql += " AND snapshot_date = ?"
+            params.append(_to_date(snapshot_date).isoformat())
+        return int(self._db.fetchall(sql, params)[0][0])
+
+    @staticmethod
+    def _snap_row(r: tuple) -> dict:
+        return {"snapshot_date": _to_date(r[0]), "value": None if r[1] is None else float(r[1]),
+                "value_json": _loads(r[2]) if r[2] else None, "captured_at": str(r[3]) if r[3] else None}
+
+    # -- lifecycle -------------------------------------------------------
+
+    def close(self) -> None:
+        self._db.close()
+
+
+def _loads(s) -> Any:
+    if s is None or s == "":
+        return {}
+    if not isinstance(s, (str, bytes)):
+        return s
+    try:
+        return json.loads(s)
+    except (TypeError, ValueError):
+        return {"raw": s}
+
+
+__all__ = [
+    "Memory", "MemoryStore", "HashEmbedder", "VertexEmbedder", "default_embedder", "keyword_scores", "cosine",
+    "SHARED_FACTS", "prefs_namespace", "rules_namespace", "episodes_namespace", "episode_ttl_days",
+    "DEFAULT_DB_URL", "DEFAULT_EPISODE_TTL_DAYS",
+]

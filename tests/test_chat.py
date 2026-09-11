@@ -43,6 +43,18 @@ def no_real_llm_or_provider(monkeypatch):
         AssertionError("providers.factory.get_provider() must not be called in tests")))
 
 
+@pytest.fixture(autouse=True)
+def memory_store():
+    """Every test gets an in-memory MemoryStore with the deterministic hash embedder (no data/memory.db)."""
+    from providers import factory
+    from providers.memory_store import HashEmbedder, MemoryStore
+
+    store = MemoryStore("sqlite:///:memory:", embedder=HashEmbedder())
+    factory.set_memory_store(store)
+    yield store
+    factory.reset_memory_store()
+
+
 # ----------------------------------------------------------------------------
 # synthetic data
 # ----------------------------------------------------------------------------
@@ -242,11 +254,32 @@ def test_get_chat_tools_names():
 
 def test_default_tools_include_desk_tools():
     from tools.desk_tools import DESK_TOOL_NAMES
+    from tools.memory_tools import MEMORY_TOOL_NAMES
+    from tools.sheet_tools import SHEET_TOOL_NAMES
 
     names = [t.name for t in chat.default_tools()]
-    assert names[: len(get_chat_tools())] == [t.name for t in get_chat_tools()]
-    assert names[len(get_chat_tools()):] == DESK_TOOL_NAMES
-    assert len(names) == len(set(names))  # no duplicates
+    n_chat, n_desk, n_sheet = len(get_chat_tools()), len(DESK_TOOL_NAMES), len(SHEET_TOOL_NAMES)
+    assert names[:n_chat] == [t.name for t in get_chat_tools()]
+    assert names[n_chat:n_chat + n_desk] == DESK_TOOL_NAMES
+    assert names[n_chat + n_desk:n_chat + n_desk + n_sheet] == SHEET_TOOL_NAMES
+    n_fixed = n_chat + n_desk + n_sheet
+    assert names[n_fixed:n_fixed + len(MEMORY_TOOL_NAMES)] == MEMORY_TOOL_NAMES
+    # snapshot tools are optional: registered only when tools/snapshot_tools.py exists
+    try:
+        from tools.snapshot_tools import get_snapshot_tools
+    except ImportError:
+        assert names[n_fixed + len(MEMORY_TOOL_NAMES):] == []
+    else:
+        assert names[n_fixed + len(MEMORY_TOOL_NAMES):] == [t.name for t in get_snapshot_tools()]
+    assert len(set(names)) == len(names)  # no duplicate tool names across the groups
+
+
+def test_default_tools_skip_missing_snapshot_module(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "tools.snapshot_tools", None)  # import raises ImportError
+    names = [t.name for t in chat.default_tools()]
+    assert "remember" in names and not any(n.startswith("get_snapshot") for n in names)
 
 
 # ----------------------------------------------------------------------------
@@ -261,9 +294,12 @@ def test_system_prompt_today_injection():
     assert "2.5" in prompt and "30-day" in prompt
     for tool_name in ("get_zscore_signals", "get_token_metrics", "get_price_history",
                       "run_full_signals_analysis", "list_token_universe",
-                      "get_desk_risk_snapshot", "get_perp_positions", "query_desk_data"):
+                      "get_desk_risk_snapshot", "get_perp_positions", "query_desk_data",
+                      "remember", "recall", "forget", "what_do_you_remember", "set_channel_rule", "clear_channel_rule"):
         assert tool_name in prompt
     assert "Desk data (BigQuery)" in prompt and "data_quality_flag" in prompt and "brokerage_a1" in prompt
+    assert "## Long-term memory" in prompt and "<memories>" in prompt
+    assert "Never store positions, PnL" in prompt and "forget everything about" in prompt
 
 
 def test_system_prompt_fallback_when_file_missing(tmp_path):
@@ -336,3 +372,158 @@ def test_one_shot_cli(monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "BTC" in out and "is calm" in out
+
+
+# ----------------------------------------------------------------------------
+# chat.py: long-term memory wiring
+# ----------------------------------------------------------------------------
+
+class RecordingFakeLLM(ToolAwareFakeLLM):
+    """Records the exact message list each model call receives."""
+
+    def _generate(self, messages, *args, **kwargs):
+        RECORDED.append(list(messages))
+        return super()._generate(messages, *args, **kwargs)
+
+
+RECORDED: list = []
+
+
+@pytest.fixture
+def recorded():
+    RECORDED.clear()
+    return RECORDED
+
+
+def test_recall_injected_into_system_prompt_only(memory_store, recorded):
+    from providers.memory_store import prefs_namespace
+
+    memory_store.put("facts:shared", "Take rate is quoted in bps")
+    memory_store.put(prefs_namespace("local"), "prefers bps not percent")
+    memory_store.put(prefs_namespace("U_OTHER"), "OTHER USER SECRET")
+    llm = RecordingFakeLLM(messages=iter([AIMessage(content="12 bps"), AIMessage(content="ok")]))
+    session = chat.ChatSession(llm=llm, tools=[], system_prompt="BASE PROMPT", memory_store=memory_store)
+
+    answer, _ = session.ask("what is the take rate in bps?")
+    assert answer == "12 bps"
+    system = recorded[0][0]
+    assert system.type == "system"
+    assert system.content.startswith("BASE PROMPT\n\n<memories>")
+    assert "Take rate is quoted in bps" in system.content and "prefers bps not percent" in system.content
+    assert "OTHER USER SECRET" not in system.content
+    assert session.last_memory_context.startswith("<memories>")
+    # the persisted conversation stays clean: no memories in the human message
+    history = session._history()
+    assert [m.type for m in history] == ["human", "ai"]
+    assert history[0].content == "what is the take rate in bps?"
+    # a turn with nothing relevant gets the bare prompt
+    session.ask("hello there")
+    assert recorded[1][0].content == "BASE PROMPT"
+    assert session.last_memory_context == ""
+
+
+def test_identity_contextvars_reach_tools(memory_store):
+    from langchain_core.tools import tool
+
+    from tools import context as ctx
+
+    @tool("whoami")
+    def whoami() -> str:
+        """Report the caller."""
+        return f"{ctx.current_user_id.get()}@{ctx.current_channel_id.get()}"
+
+    llm = ToolAwareFakeLLM(messages=iter([
+        AIMessage(content="", tool_calls=[{"name": "whoami", "args": {}, "id": "c1"}]),
+        AIMessage(content="done"),
+    ]))
+    session = chat.ChatSession(llm=llm, tools=[whoami], system_prompt="p", memory_store=memory_store)
+    session.ask("who am i?")
+    tool_out = [m.content for m in session._history() if m.type == "tool"]
+    assert tool_out == ["local@terminal"]
+    assert ctx.current_user_id.get() is None  # restored after the turn
+
+
+def test_remember_tool_inside_agent_uses_terminal_identity(memory_store):
+    from providers.memory_store import prefs_namespace
+    from tools.memory_tools import remember
+
+    llm = ToolAwareFakeLLM(messages=iter([
+        AIMessage(content="", tool_calls=[{"name": "remember", "args": {"text": "I prefer bps", "scope": "me"}, "id": "c1"}]),
+        AIMessage(content="Stored."),
+    ]))
+    session = chat.ChatSession(llm=llm, tools=[remember], system_prompt="p", memory_store=memory_store)
+    answer, tools_called = session.ask("remember that I prefer bps")
+    assert tools_called == ["remember"] and answer == "Stored."
+    assert [m.text for m in memory_store.list(prefs_namespace("local"))] == ["I prefer bps"]
+
+
+class FakeEpisodeLLM:
+    def __init__(self):
+        self.calls = 0
+
+    def invoke(self, prompt):
+        self.calls += 1
+        return AIMessage(content="local asked about BTC funding; z 2.6 as of 2026-09-10.")
+
+
+def test_session_close_and_reset_store_episode(memory_store):
+    from providers.memory_store import episodes_namespace
+
+    ep = FakeEpisodeLLM()
+    llm = ToolAwareFakeLLM(messages=iter([AIMessage(content="first"), AIMessage(content="second")]))
+    session = chat.ChatSession(llm=llm, tools=[], system_prompt="p", memory_store=memory_store, episode_llm=lambda: ep)
+    assert session.close() is None  # nothing said yet -> no episode, no LLM call
+    assert ep.calls == 0
+    session.ask("btc funding?")
+    old_thread = session.thread_id
+    session.reset(summarise=True)
+    assert ep.calls == 1 and session.thread_id != old_thread
+    eps = memory_store.list(episodes_namespace("local"))
+    assert len(eps) == 1 and eps[0].text.startswith("local asked about BTC funding")
+    assert eps[0].meta["channel"] == "terminal" and eps[0].meta["session_key"] == old_thread
+    assert eps[0].expires_at is not None
+    session.ask("again")
+    assert session.close() is not None and ep.calls == 2
+    assert len(memory_store.list(episodes_namespace("local"))) == 2
+
+
+def test_session_close_never_raises(memory_store, caplog):
+    class Boom:
+        def invoke(self, p):
+            raise RuntimeError("vertex down")
+
+    llm = ToolAwareFakeLLM(messages=iter([AIMessage(content="x")]))
+    session = chat.ChatSession(llm=llm, tools=[], system_prompt="p", memory_store=memory_store, episode_llm=lambda: Boom())
+    session.ask("q")
+    with caplog.at_level("WARNING"):
+        assert session.close() is None
+
+
+def test_repl_quit_and_reset_summarise(monkeypatch, memory_store):
+    from providers.memory_store import episodes_namespace
+
+    ep = FakeEpisodeLLM()
+    llm = ToolAwareFakeLLM(messages=iter([AIMessage(content="a1"), AIMessage(content="a2")]))
+    session = chat.ChatSession(llm=llm, tools=[], system_prompt="p", memory_store=memory_store, episode_llm=lambda: ep)
+    inputs = iter(["first question", "/reset", "second question", "/memory", "/quit"])
+
+    class Console:
+        def __init__(self):
+            self.out = []
+
+        def print(self, *a, **k):
+            self.out.append(" ".join(str(x) for x in a))
+
+        def input(self, prompt=""):
+            return next(inputs)
+
+        def status(self, *a, **k):
+            from contextlib import nullcontext
+            return nullcontext()
+
+    console = Console()
+    assert chat.repl(console, session) == 0
+    assert ep.calls == 2  # /reset and /quit each summarised a conversation with a reply
+    assert len(memory_store.list(episodes_namespace("local"))) == 2
+    text = "\n".join(console.out)
+    assert "conversation summary saved" in text and "Your preferences (0)" in text and "bye" in text

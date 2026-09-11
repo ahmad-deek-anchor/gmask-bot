@@ -1,0 +1,16 @@
+# systemd --user oneshot: daily data snapshot (Haruko desk risk, market signals, spot
+# desk PnL sheet) into the memory store's `snapshots` table (data/memory.db by default).
+# Triggered by trading-signals-snapshot.timer. Not enabled by default.
+[Unit]
+Description=Trading signals daily data snapshot -> memory store
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ahmaddeek/program/signals-main
+ExecStart=/home/ahmaddeek/program/signals-main/.venv/bin/python snapshot_daily.py --verbose
+Environment=PYTHONUNBUFFERED=1
+# Optional: MEMORY_DB_URL=sqlite:///data/memory.db (default) or postgresql://...
+# EnvironmentFile=-%h/program/signals-main/.env
+TimeoutStartSec=20min

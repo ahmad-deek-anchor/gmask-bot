@@ -3,8 +3,17 @@
 
 Bolt in Socket Mode (no inbound HTTP). Mentions in channels and DMs go to the same
 LangGraph ReAct agent as ``chat.py`` (Claude on Vertex AI + tools/chat_tools.py +
-tools/desk_tools.py for the desk's BigQuery data), with conversation memory
-persisted in SQLite and keyed by Slack thread.
+tools/desk_tools.py for the desk's BigQuery data + tools/memory_tools.py), with
+conversation memory persisted in SQLite and keyed by Slack thread.
+
+Long-term memory (providers/memory_store.py): every turn runs with the Slack user /
+channel ids in ``tools.context`` contextvars (so `remember` / `forget` / channel rules
+know who is asking) and gets the relevant shared facts, that user's preferences and
+past-conversation summaries and the channel's standing rule injected into the system
+prompt of the model call (never into the stored messages). When a session closes
+(idle timeout seen on the next message, `reset`, or stale sessions found at start-up)
+or after every 6th reply, the conversation is summarised in a background task into
+``episodes:<user>`` (TTL MEMORY_EPISODE_TTL_DAYS, default 90).
 
 Usage
 -----
@@ -41,6 +50,8 @@ from langchain_core.tools import tool
 
 from chat import RECURSION_LIMIT, build_chat_agent, load_system_prompt, message_text
 from notifiers.slack import CHUNK_CHARS, chunk_text, to_mrkdwn
+from tools.context import request_context
+from tools.memory_tools import EPISODE_EVERY_N_REPLIES, build_context, count_replies, record_episode
 
 log = logging.getLogger("slack_bot")
 
@@ -62,7 +73,8 @@ EMPTY_TEXT = "_(no response)_"
 MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 
 __all__ = ["clean", "to_mrkdwn", "chunk_text", "handle", "answer", "should_handle_dm",
-           "conversation_key", "SessionStore", "is_reset", "build_agent", "build_app", "current_time", "RecordingClient"]
+           "conversation_key", "SessionStore", "is_reset", "build_agent", "build_app", "current_time", "RecordingClient",
+           "spawn_episode", "flush_background", "episode_llm"]
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +146,8 @@ class SessionStore:
         self.now = now
         self.active: dict[str, dict] = {}   # "channel:user" -> {"key": ..., "last": epoch}
         self.threads: dict[str, str] = {}   # "channel:thread_ts" -> session key
+        self.episodes: dict[str, int] = {}  # session key -> assistant replies already summarised
+        self.closed: list[dict] = []        # sessions that ended since the last drain_closed()
         self._load()
 
     def _load(self) -> None:
@@ -141,6 +155,7 @@ class SessionStore:
             data = json.loads(self.path.read_text())
             self.active = dict(data.get("active", {}))
             self.threads = dict(data.get("threads", {}))
+            self.episodes = {k: int(v) for k, v in dict(data.get("episodes", {})).items()}
         except (FileNotFoundError, ValueError, OSError):
             pass
 
@@ -148,14 +163,60 @@ class SessionStore:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"active": self.active, "threads": self.threads}))
+            tmp.write_text(json.dumps({"active": self.active, "threads": self.threads, "episodes": self.episodes}))
             tmp.replace(self.path)
         except OSError as e:  # never let bookkeeping break a reply
             log.warning("could not persist sessions to %s: %s", self.path, e)
 
+    # -- session lifecycle (episodic memory hooks) ------------------------
+
+    @staticmethod
+    def _started(key: str, sess: dict) -> float:
+        """Epoch the session started: the suffix of 'channel:user:<epoch>' keys, else its first-seen time."""
+        try:
+            return float(key.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            return float(sess.get("started") or sess.get("last") or 0)
+
+    def _close(self, akey: str, sess: dict) -> None:
+        channel, _, user = akey.partition(":")
+        key = sess.get("key", "")
+        if key:
+            self.closed.append({"key": key, "channel": channel, "user": user,
+                                "started": self._started(key, sess), "last": float(sess.get("last", 0))})
+
+    def drain_closed(self) -> list[dict]:
+        """Sessions that ended since the last call (idle timeout, reset, expire_stale)."""
+        out, self.closed = self.closed, []
+        return out
+
+    def expire_stale(self) -> list[dict]:
+        """Close every active session idle for longer than the timeout (bot start-up); returns them."""
+        now = self.now()
+        stale = [(akey, sess) for akey, sess in self.active.items() if now - sess.get("last", 0) > self.idle]
+        for akey, sess in stale:
+            self._close(akey, sess)
+            del self.active[akey]
+        if stale:
+            self._save()
+        return self.drain_closed()
+
+    def summarised_replies(self, key: str) -> int:
+        return int(self.episodes.get(key, 0))
+
+    def mark_summarised(self, key: str, replies: int) -> None:
+        self.episodes[key] = int(replies)
+        if len(self.episodes) > 2000:
+            for k in list(self.episodes)[:-1000]:
+                del self.episodes[k]
+        self._save()
+
     def reset(self, event: dict) -> None:
-        """Forget the sender's current session in this channel."""
-        self.active.pop(f"{event['channel']}:{event.get('user', 'unknown')}", None)
+        """Forget the sender's current session in this channel (it is queued for an episode summary)."""
+        akey = f"{event['channel']}:{event.get('user', 'unknown')}"
+        sess = self.active.pop(akey, None)
+        if sess:
+            self._close(akey, sess)
         self._save()
 
     def key_for(self, event: dict) -> tuple[str, Optional[str]]:
@@ -181,6 +242,8 @@ class SessionStore:
         if sess and now - sess.get("last", 0) <= self.idle:
             key = sess["key"]
         else:
+            if sess:
+                self._close(akey, sess)  # idle timeout: the old session ends here
             key = f"{channel}:{user}:{int(now)}"
         self.active[akey] = {"key": key, "last": now}
         reply_ts = ts if (not is_dm and REPLY_IN_THREAD) else None
@@ -241,12 +304,33 @@ async def build_agent(db_path: str | None = None, llm=None, tools=None, system_p
                                checkpointer=checkpointer)
 
 
-async def answer(agent, thread_id: str, user_id: str, text: str) -> str:
-    """Run one turn on ``thread_id`` and return the final assistant text."""
-    result = await agent.ainvoke(
-        {"messages": [HumanMessage(content=f"<@{user_id}>: {text}")]},
-        config={"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT},
-    )
+def _memory_store():
+    from providers.factory import get_memory_store
+
+    return get_memory_store()
+
+
+async def answer(agent, thread_id: str, user_id: str, text: str, channel_id: str | None = None,
+                 is_dm: bool = False, recall: bool = True) -> str:
+    """Run one turn on ``thread_id`` and return the final assistant text.
+
+    The Slack identity is published to the memory tools through ``tools.context`` and the
+    relevant memories (shared facts, this user's prefs / episodes, this channel's rule) are
+    injected into the system prompt of the model call via ``tools.context.current_memory_context``.
+    """
+    block = ""
+    if recall:
+        try:
+            block = await asyncio.to_thread(build_context, user_id, channel_id, text, _memory_store())
+        except Exception as e:  # noqa: BLE001 - memory must never block a reply
+            log.warning("memory recall failed: %s", e)
+    if block:
+        log.info("recall thread=%s user=%s chars=%d", thread_id, user_id, len(block))
+    with request_context(user_id, channel_id, is_dm=is_dm, memory_context=block):
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=f"<@{user_id}>: {text}")]},
+            config={"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT},
+        )
     messages = result.get("messages", [])
     for m in reversed(messages):
         if getattr(m, "type", "") == "ai" and not (getattr(m, "tool_calls", None) or []):
@@ -259,6 +343,70 @@ async def answer(agent, thread_id: str, user_id: str, text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Episodic memory: summarise sessions in the background
+# ---------------------------------------------------------------------------
+
+BACKGROUND_TASKS: set = set()
+
+
+def episode_llm():
+    """Small-output LLM for episode summaries (monkeypatched in tests)."""
+    from tools.memory_tools import episode_llm as _factory
+
+    return _factory()
+
+
+async def _thread_messages(agent, key: str) -> list:
+    getter = getattr(agent, "aget_state", None)
+    if getter is None:
+        return []
+    state = await getter({"configurable": {"thread_id": key}})
+    return list((getattr(state, "values", None) or {}).get("messages", []))
+
+
+async def _summarise(agent, sessions: "SessionStore", info: dict, final: bool) -> Optional[str]:
+    """Store an episode for session ``info`` when it has enough new replies. Never raises."""
+    key, user, channel = info["key"], info.get("user", "unknown"), info.get("channel")
+    try:
+        messages = await _thread_messages(agent, key)
+        n, done = count_replies(messages), sessions.summarised_replies(key)
+        if n == 0 or n <= done or (not final and n - done < EPISODE_EVERY_N_REPLIES):
+            return None
+        llm = episode_llm()
+        mem_id = await asyncio.to_thread(record_episode, _memory_store(), user, channel, key, messages, llm,
+                                         info.get("started"), info.get("last") or time.time())
+        if mem_id:
+            sessions.mark_summarised(key, n)
+            log.info("episode %s stored for user=%s session=%s (%d replies, final=%s)", mem_id[:8], user, key, n, final)
+        return mem_id
+    except Exception as e:  # noqa: BLE001
+        log.warning("episode summary failed session=%s: %s", key, e)
+        return None
+
+
+def spawn_episode(agent, sessions: "SessionStore", info: dict, final: bool = True):
+    """Schedule the summary as a background task (so replies are never delayed). Returns the task."""
+    try:
+        task = asyncio.get_running_loop().create_task(_summarise(agent, sessions, info, final))
+    except RuntimeError:  # no running loop (sync test helper) - run inline
+        return asyncio.run(_summarise(agent, sessions, info, final))
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+    return task
+
+
+async def flush_background() -> None:
+    """Wait for pending episode summaries (selftest / tests / shutdown)."""
+    if BACKGROUND_TASKS:
+        await asyncio.gather(*list(BACKGROUND_TASKS), return_exceptions=True)
+
+
+def _flush_closed(agent, sessions: "SessionStore") -> None:
+    for info in sessions.drain_closed():
+        spawn_episode(agent, sessions, info, final=True)
+
+
+# ---------------------------------------------------------------------------
 # Slack event handling
 # ---------------------------------------------------------------------------
 
@@ -267,12 +415,14 @@ async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, 
     """Placeholder -> agent -> update placeholder (+ threaded overflow chunks)."""
     channel = event["channel"]
     user = event.get("user", "unknown")
+    is_dm = event.get("channel_type") == "im"
     text = clean(event.get("text", ""))
     if not text:
         return
     sessions = sessions or get_sessions()
     if is_reset(text):
         sessions.reset(event)
+        _flush_closed(agent, sessions)  # summarise the conversation that just ended
         kwargs = {"channel": channel, "text": RESET_TEXT}
         if event.get("thread_ts") or (event.get("channel_type") != "im" and REPLY_IN_THREAD):
             kwargs["thread_ts"] = event.get("thread_ts") or event["ts"]
@@ -280,6 +430,7 @@ async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, 
         log.info("session reset channel=%s user=%s", channel, user)
         return
     thread_id, reply_ts = sessions.key_for(event)
+    _flush_closed(agent, sessions)  # a session that timed out ends now
     log.info("request thread=%s user=%s chars=%d", thread_id, user, len(text))
 
     if react:
@@ -296,14 +447,22 @@ async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, 
         # top-level answer: a follow-up threaded under the bot's reply continues this session
         sessions.remember_thread(channel, placeholder["ts"], thread_id)
 
+    ok = False
     try:
-        reply = await asyncio.wait_for(answer(agent, thread_id, user, text), timeout=timeout)
+        reply = await asyncio.wait_for(answer(agent, thread_id, user, text, channel_id=channel, is_dm=is_dm),
+                                       timeout=timeout)
+        ok = True
     except asyncio.TimeoutError:
         log.warning("agent timed out after %ss thread=%s", timeout, thread_id)
         reply = TIMEOUT_TEXT
     except Exception:  # noqa: BLE001
         log.exception("agent failed thread=%s", thread_id)
         reply = ERROR_TEXT
+    if ok:
+        # every 6th reply: roll the session into an episode summary (background)
+        spawn_episode(agent, sessions, {"key": thread_id, "channel": channel, "user": user,
+                                        "started": SessionStore._started(thread_id, {"last": time.time()}),
+                                        "last": time.time()}, final=False)
 
     reply = to_mrkdwn(reply) or EMPTY_TEXT
     chunks = chunk_text(reply, CHUNK_CHARS)
@@ -386,10 +545,19 @@ async def run_bot() -> int:
         return 2
 
     async with build_agent() as agent:
+        sessions = get_sessions()
+        stale = sessions.expire_stale()
+        if stale:
+            log.info("summarising %d stale session(s) from before the restart", len(stale))
+            for info in stale:
+                spawn_episode(agent, sessions, info, final=True)
         app = build_app(agent, bot_token)
         handler = AsyncSocketModeHandler(app, app_token)
         log.info("starting Socket Mode (db=%s)", os.getenv("SLACK_BOT_DB", DEFAULT_DB))
-        await handler.start_async()
+        try:
+            await handler.start_async()
+        finally:
+            await flush_background()
     return 0
 
 
@@ -400,6 +568,7 @@ async def run_selftest(question: str) -> int:
              "ts": "1.000000", "text": f"<@UBOT> {question}"}
     async with build_agent() as agent:
         await handle(event, client, agent)
+        await flush_background()
     print("--- placeholder posted:", client.posts[0]["text"] if client.posts else None)
     print("--- reaction:", [r["name"] for r in client.reactions])
     for i, text in enumerate(client.final_texts(), 1):

@@ -15,6 +15,11 @@ and thousands separators.
 
 Tables used (dataset ``brokerage_a1`` unless noted; verified 2026-09-10):
 
+* ``fct_otc_haruko_position_pnl_history`` (+ ``fct_otcderivatives_trades``) - the
+  position-level snapshot history behind ``get_derivs_pnl_eod``: Carson Levy's EOW
+  method run live via ``sql/haruko_eod_pnl.sql`` / ``providers/haruko_eod.py``
+  (3pm America/Chicago EOD cut, LTD differences; ~15 GB per run, cached 15 min).
+  This is the **authoritative** source for monthly / MTD / YTD derivatives PnL.
 * ``fct_otc_haruko_pnl_portfolio`` - portfolio snapshot every ~5 min, one row per
   entity: position/venue/asset counts, ``total_abs_size_usd`` (gross notional),
   ``total_equity_usd``, ``total_portfolio_pnl`` (day), WTD/MTD/QTD/YTD/LTD PnL,
@@ -54,6 +59,7 @@ import pandas as pd
 from langchain_core.tools import tool
 
 from providers.bigquery import SQLGuardError, format_bytes
+from providers.haruko_eod import METHOD_LINE, HarukoEodError, HarukoEodPnl
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +105,18 @@ UNAVAILABLE = (
     "Desk data (BigQuery) is not available: google-cloud-bigquery or Application Default "
     "Credentials are missing. Market-data tools still work."
 )
+
+_haruko_eod: Dict[int, HarukoEodPnl] = {}   # one HarukoEodPnl (with its 15-min cache) per DeskBigQuery
+
+
+def _get_haruko_eod(bq) -> HarukoEodPnl:
+    """HarukoEodPnl bound to ``bq``; memoised so the TTL cache survives across tool calls."""
+    inst = _haruko_eod.get(id(bq))
+    if inst is None or inst.bq is not bq:
+        inst = HarukoEodPnl(bq)
+        _haruko_eod.clear()
+        _haruko_eod[id(bq)] = inst
+    return inst
 
 
 def _guarded(name: str, body: Callable) -> str:
@@ -467,7 +485,10 @@ LIMIT 200"""
             if df.empty:
                 return f"No EOD portfolio rows in the last {n} days (fct_otc_haruko_pnl_portfolio_history_eod)."
             lines = [f"### Desk PnL history, portfolio level (EOD, last {n} days, "
-                     f"{_date(df['as_of_date'].min())} to {_date(df['as_of_date'].max())})"]
+                     f"{_date(df['as_of_date'].min())} to {_date(df['as_of_date'].max())})",
+                     "Note: for monthly / MTD / YTD derivatives PnL use `get_derivs_pnl_eod` (Carson Levy's EOW "
+                     "method, 3pm CT cut, LTD differences) - it is authoritative and matches the EOW report; "
+                     "this table is Haruko's ~23:55 UTC portfolio snapshot for intraday / risk context."]
             for eid, g in df.groupby("entity_id", sort=True):
                 g = g.sort_values("as_of_date")
                 first, last = g.iloc[0], g.iloc[-1]
@@ -551,6 +572,101 @@ LIMIT 200"""
         return "\n".join(lines)
 
     return _guarded("get_desk_pnl_history", body)
+
+
+@tool("get_derivs_pnl_eod")
+def get_derivs_pnl_eod(period: str = "mtd", include_daily: bool = False) -> str:
+    """Derivatives desk PnL for a period using Carson Levy's end-of-week (EOW) report method, run live in BigQuery - the authoritative Haruko PnL for monthly, MTD, YTD, weekly and custom ranges.
+
+    Method: uniform 3pm America/Chicago end-of-day cut on
+    ``fct_otc_haruko_position_pnl_history`` (one full-book snapshot per day, positions
+    de-duplicated), PnL = difference in summed life-to-date PnL between EOD rows.
+    Monthly figures therefore never use Haruko's month_to_date column (it resets
+    mid-month; August 2026 shows -$18,923 there vs the true +$2,174,523). Total book,
+    A1 Ltd + ADSD combined. The query scans ~15 GB (~$0.08) and takes ~45 s cold; the
+    result is cached for 15 min so follow-up periods are instant.
+
+    Args:
+        period: 'mtd' (default), 'wtd', 'ytd' (reports both Haruko SUM(year_to_date_pnl) and the
+            LTD change since the first snapshot), 'last_week' (last complete Mon-Sun week),
+            'last_month', 'month:YYYY-MM' (e.g. 'month:2026-08'), or 'range:YYYY-MM-DD..YYYY-MM-DD'.
+        include_daily: also list the daily EOD PnL rows of the period (max 31 rows, most recent).
+    """
+    def body(bq) -> str:
+        h = _get_haruko_eod(bq)
+        try:
+            df = h.frame()
+        except HarukoEodError as e:
+            return f"Could not run the EOW PnL query: {e}"
+        if df.empty:
+            return "The EOW PnL query returned no EOD snapshots (fct_otc_haruko_position_pnl_history)."
+        try:
+            res = h.period(period, df)
+        except HarukoEodError as e:
+            return f"Bad period {period!r}: {e}"
+        latest = h.latest(df)
+        first_date = df["eod_date"].iloc[0]
+
+        lines = [f"### Derivatives desk PnL (Haruko, EOW method) - {res.label}",
+                 f"Method: {METHOD_LINE}.", ""]
+        if res.kind == "ytd":
+            lines += [f"**YTD {res.end.year} PnL (Haruko SUM(year_to_date_pnl) at {_date(res.end)} EOD): {_usd(res.ytd_sum)}**",
+                      f"**YTD as LTD change since first available snapshot ({_date(first_date)} -> {_date(res.end)}): "
+                      f"{_usd(res.ytd_ltd_change)}**"]
+        else:
+            base_txt = (f"LTD {_usd(res.baseline_ltd)} at the first available snapshot {_date(res.baseline_date)}"
+                        if res.from_first_row else f"LTD {_usd(res.baseline_ltd)} at {_date(res.baseline_date)} EOD")
+            lines += [f"**{res.label} PnL: {_usd(res.pnl)}** ({base_txt} -> {_usd(res.end_ltd)} at {_date(res.end)} EOD; "
+                      f"{res.n_days} EOD days)"]
+        if len(res.daily):
+            d = res.daily
+            best, worst = d.loc[d["daily_pnl"].idxmax()], d.loc[d["daily_pnl"].idxmin()]
+            lines.append(f"- best day {_usd(best['daily_pnl'])} ({_date(best['eod_date'])}), worst day "
+                         f"{_usd(worst['daily_pnl'])} ({_date(worst['eod_date'])}); OTC trades in period: "
+                         f"{int(d['n_trades'].fillna(0).sum()):,}, notional {_usd(d['notional_quote'].fillna(0).sum())}")
+        lines.append(f"- Haruko's own columns at {_date(res.end)} EOD, for reference only (they reset mid-period, do not "
+                     f"quote them as period PnL): MTD {_usd(res.haruko_mtd)}, WTD {_usd(res.haruko_wtd)}")
+        for note in res.notes:
+            lines.append(f"- {note}")
+
+        if res.months is not None and len(res.months) > 1:
+            lines += ["", "**Monthly PnL (LTD difference at month-end EOD)**", ""]
+            rows = []
+            for _, m in res.months.iterrows():
+                tag = " (MTD, partial)" if m["partial"] else (" (from first snapshot)" if m["from_first_row"] else "")
+                rows.append([m["month"] + tag, _usd(m["pnl"]), f"{_date(m['baseline'])} -> {_date(m['end'])}",
+                             str(int(m["n_days"])), _usd(m["haruko_mtd"])])
+            lines += _md_table(["month", "PnL", "LTD from -> to", "EOD days", "Haruko MTD col (ref)"], rows)
+
+        if include_daily and len(res.daily):
+            d = res.daily.tail(31)
+            lines += ["", f"**Daily EOD PnL** ({'last 31 of ' if len(res.daily) > 31 else ''}{len(res.daily)} days)", ""]
+            rows = [[_date(r["eod_date"]), _usd(r["daily_pnl"]), _usd(r["ltd_pnl"]), f"{int(r['n_positions']):,}",
+                     f"{int(r['skew_secs']):+d}s" if not _isna(r["skew_secs"]) else "n/a",
+                     f"{int(r['n_trades']):,}" if not _isna(r["n_trades"]) else "0"] for _, r in d.iterrows()]
+            lines += _md_table(["EOD date", "day PnL", "LTD PnL", "positions", "cut skew", "trades"], rows)
+
+        lines += ["", f"Latest EOD snapshot: {_date(latest['eod_date'])} (cut skew {int(latest['skew_secs']):+d}s, "
+                      f"{int(latest['n_positions']):,} positions)."]
+        if latest.get("stale"):
+            lines.append(f"WARNING: the latest EOD snapshot is {latest['business_days_behind']} business days old "
+                         f"(today {h.today().isoformat()} America/Chicago) - the series may be missing recent days; "
+                         "check the Haruko snapshot job before quoting the figure as current.")
+        lines += [f"Data coverage: EOD snapshots from {_date(first_date)} (first row) to {_date(latest['eod_date'])}; "
+                  f"periods starting earlier are measured from {_date(first_date)}.",
+                  "Caveats: total book A1 Ltd + ADSD combined (no entity split in this method); Haruko MTD/WTD "
+                  "columns shown for reference only; PnL is Haruko mark-to-market life-to-date differences, not the "
+                  "spot desk's booked PnL.",
+                  f"{_bytes_note(df)} BigQuery cache hit: {_yes_no(df.attrs.get('cache_hit'))}; "
+                  + (f"served from the in-process 15-min cache (age {int(df.attrs.get('cache_age_s', 0))}s)."
+                     if df.attrs.get("from_cache") else "fresh run (result cached in-process for 15 min).")]
+        return "\n".join(lines)
+
+    return _guarded("get_derivs_pnl_eod", body)
+
+
+def _yes_no(v) -> str:
+    return "n/a" if v is None else ("yes" if v else "no")
 
 
 @tool("get_desk_greeks_history")
@@ -1108,6 +1224,7 @@ def get_desk_tools() -> list:
     return [
         get_desk_risk_snapshot,
         get_desk_pnl_history,
+        get_derivs_pnl_eod,
         get_desk_greeks_history,
         get_perp_positions,
         get_desk_positions_by_symbol,
@@ -1127,6 +1244,7 @@ __all__ = [
     "ENTITY_NAMES",
     "desk_symbol_to_token",
     "describe_desk_table",
+    "get_derivs_pnl_eod",
     "get_desk_greeks_history",
     "get_desk_pnl_history",
     "get_desk_positions_by_symbol",

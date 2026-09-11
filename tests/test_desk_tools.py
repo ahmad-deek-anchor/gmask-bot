@@ -294,7 +294,7 @@ def fake(monkeypatch):
 def test_get_desk_tools_names_and_docs():
     names = [t.name for t in get_desk_tools()]
     assert names == [
-        "get_desk_risk_snapshot", "get_desk_pnl_history", "get_desk_greeks_history", "get_perp_positions",
+        "get_desk_risk_snapshot", "get_desk_pnl_history", "get_derivs_pnl_eod", "get_desk_greeks_history", "get_perp_positions",
         "get_desk_positions_by_symbol", "get_otc_derivatives_trades", "get_open_orders", "get_internal_price",
         "list_desk_tables", "describe_desk_table", "query_desk_data",
     ]

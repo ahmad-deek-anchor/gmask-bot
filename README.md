@@ -272,20 +272,23 @@ Table metadata comes from the table API (works with these grants) and is cached 
 | `BQ_DATA_PROJECT` | `anc-global-markets` | where the tables live |
 | `BQ_BILLING_PROJECT` | `anchorage-corp-eng-playground` | jobs run + are billed here |
 | `BQ_ALLOWED_DATASETS` | `brokerage_a1,pricing` | the only datasets SQL may reference |
-| `BQ_MAX_BYTES_BILLED` | `2000000000` (2 GB) | `maximum_bytes_billed` on every job |
+| `BQ_MAX_BYTES_BILLED` | `20000000000` (20 GB) | `maximum_bytes_billed` on every job. Raised from 2 GB on 2026-09-11 so Carson Levy's EOW derivatives PnL script (`get_derivs_pnl_eod`, ~15 GB per run, ~$0.08) can run live; 20 GB is ~$0.13 worst case per query at $6.25/TB |
 | `BQ_MAX_ROWS` | `200` | `LIMIT` appended / lowered on every query |
 | `BQ_TIMEOUT_S` | `60` | query timeout |
 | `BQ_CATALOG_PATH` | `data/bq_catalog.json` | schema cache (TTL 24 h) |
 
 **Guards** (`providers.bigquery.validate_sql`, applied before anything reaches BigQuery):
 single `SELECT` / `WITH` statement only (DML, DDL, scripting and `;`-separated statements
-are refused); every table reference - backticked or not, `project.dataset.table`,
+are refused; the one exception is `DeskBigQuery.query_script` / `validate_declare_script`,
+used only by project code for `sql/haruko_eod_pnl.sql`: a script whose statements are
+`DECLARE name TYPE DEFAULT <plain literal>;` followed by exactly one `SELECT` / `WITH`, with the
+query part going through the same `validate_sql` - never reachable from `query_desk_data`); every table reference - backticked or not, `project.dataset.table`,
 `dataset.table`, `INFORMATION_SCHEMA` views - must be in an allowed dataset of the data
 project, otherwise the error lists the allowed datasets; trailing `LIMIT` capped at
 `BQ_MAX_ROWS`; per-job cost cap. Denied datasets are never queried, so a bad request costs
 nothing. Some Haruko convenience views (`fct_otc_haruko_pnl_by_venue*`, `*_by_strategy*`,
 `fct_otc_haruko_pnl_summary`, `fct_otc_haruko_futures_positions`, `fct_otc_haruko_position_pnl`,
-`fct_otc_haruko_trades_derivs`) scan 1.5-260 GB and are refused by the cap; the tools use the
+`fct_otc_haruko_trades_derivs`) scan 1.5-260 GB, the largest are refused by the cap; the tools use the
 partitioned `fct_otc_haruko_pnl_position_history_eod` (a few MB per day) instead.
 `fct_perps_positions` is stale (last snapshot 2026-07-10) and is not used.
 
@@ -295,6 +298,7 @@ partitioned `fct_otc_haruko_pnl_position_history_eod` (a few MB per day) instead
 | Tool | Source | Answers |
 |---|---|---|
 | `get_desk_risk_snapshot()` | `fct_otc_haruko_pnl_portfolio` (snapshot every ~5 min) | positions/venues/assets, gross & net notional, equity, day/WTD/MTD/QTD/YTD/LTD PnL, funding, fees, delta/gamma/vega/theta USD, risk levels, large-change flags, data quality; per entity + combined |
+| `get_derivs_pnl_eod(period, include_daily)` | `fct_otc_haruko_position_pnl_history` + `fct_otcderivatives_trades` via `sql/haruko_eod_pnl.sql` (Carson Levy / Nayshil Dalal's EOW query, run live by `providers/haruko_eod.py`) | **authoritative derivatives PnL by period** - `mtd`, `wtd`, `ytd` (Haruko YTD column and LTD change since first snapshot, both), `last_week`, `last_month`, `month:YYYY-MM`, `range:A..B`: 3pm America/Chicago EOD cut, one full-book snapshot/day, PnL = life-to-date differences (never Haruko's month_to_date column, which resets mid-month); monthly table, optional daily rows, staleness warning, coverage note; ~15 GB / ~45 s cold, in-process cache 15 min + BigQuery query cache. August 2026 = $2,174,523, reconciled with the EOW report 2026-09-11 |
 | `get_desk_pnl_history(days, by)` | `fct_otc_haruko_pnl_portfolio_history_eod` / `..._position_history_eod` | daily EOD PnL series at portfolio level (<= 90 d) or pivoted by strategy / venue (<= 28 d) |
 | `get_desk_greeks_history(days)` | `fct_otc_haruko_greeks_history_eod` | daily EOD delta / gamma / vega / theta per entity |
 | `get_perp_positions(top_n)` | FUTURES rows of `..._position_history_eod` + live `fct_otc_haruko_position_summary` | perps and dated futures: side, size, notional, avg vs mark, open/day PnL, funding (day, LTD), delta, live qty; maps symbols to tokens for Amberdata cross-checks |
@@ -328,8 +332,9 @@ desk, portal 5, "Data or Role Access Request", then add it to `BQ_ALLOWED_DATASE
 desk tools answer "not available" / "access denied" and the market-data tools keep working.
 
 Tests: `tests/test_bigquery_provider.py` (guard, catalog cache with a fake client,
-describe formatting) and `tests/test_desk_tools.py` (every tool against canned frames
-modelled on real rows) - no GCP, no network.
+describe formatting), `tests/test_desk_tools.py` (every tool against canned frames
+modelled on real rows) and `tests/test_haruko_eod.py` (the EOW PnL maths against the
+2026-06-28..2026-09-10 series, DECLARE-script guard, TTL cache) - no GCP, no network.
 
 ## Spot desk PnL (Google Sheet)
 

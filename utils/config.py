@@ -22,7 +22,8 @@ Desk data in BigQuery (providers/bigquery.py, read-only):
 BQ_DATA_PROJECT       env BQ_DATA_PROJECT      (default anc-global-markets; where the tables live)
 BQ_BILLING_PROJECT    env BQ_BILLING_PROJECT   (default anchorage-corp-eng-playground; jobs run and are billed here)
 BQ_ALLOWED_DATASETS   env BQ_ALLOWED_DATASETS  (default "brokerage_a1,pricing"; comma separated)
-BQ_MAX_BYTES_BILLED   env BQ_MAX_BYTES_BILLED  (default 2_000_000_000 = 2 GB per query)
+BQ_MAX_BYTES_BILLED   env BQ_MAX_BYTES_BILLED  (default 20_000_000_000 = 20 GB per query; Carson Levy's
+                                               EOW derivatives PnL script scans ~15 GB, 20 GB is ~$0.13 worst case)
 BQ_MAX_ROWS           env BQ_MAX_ROWS          (default 200; LIMIT enforced on every query)
 BQ_TIMEOUT_S          env BQ_TIMEOUT_S         (default 60)
 BQ_CATALOG_PATH       env BQ_CATALOG_PATH      (default data/bq_catalog.json; 24 h table-metadata cache)
@@ -66,7 +67,7 @@ DEFAULT_VERTEX_MODEL = "claude-sonnet-4-6"
 DEFAULT_BQ_DATA_PROJECT = "anc-global-markets"
 DEFAULT_BQ_BILLING_PROJECT = "anchorage-corp-eng-playground"
 DEFAULT_BQ_ALLOWED_DATASETS = "brokerage_a1,pricing"
-DEFAULT_BQ_MAX_BYTES_BILLED = 2_000_000_000
+DEFAULT_BQ_MAX_BYTES_BILLED = 20_000_000_000  # ~$0.13 worst case; Carson's EOW PnL script ~15 GB
 DEFAULT_BQ_MAX_ROWS = 200
 DEFAULT_BQ_TIMEOUT_S = 60
 DEFAULT_BQ_CATALOG_PATH = "data/bq_catalog.json"

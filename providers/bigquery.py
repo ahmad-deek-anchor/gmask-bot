@@ -11,8 +11,16 @@ chat agent needs before it is allowed to run SQL written by an LLM:
   The caller has table-data access on exactly those datasets; everything else
   in the project is denied and referencing it would only produce a 403.
 * **Row cap.** A trailing ``LIMIT`` is appended or lowered to ``max_rows``.
-* **Cost cap.** ``maximum_bytes_billed`` is set on every job (default 2 GB) and
-  a ``dry_run()`` is available to estimate before running.
+* **Cost cap.** ``maximum_bytes_billed`` is set on every job (default 20 GB; the
+  largest sanctioned query, Carson Levy's EOW derivatives PnL script, scans ~15 GB)
+  and a ``dry_run()`` is available to estimate before running.
+* **DECLARE scripts (narrow allowance, not for LLM SQL).** ``query_script`` /
+  ``validate_declare_script`` accept a script made of ``DECLARE name TYPE DEFAULT
+  <literal>;`` statements followed by exactly one SELECT / WITH query. The query
+  part goes through the very same ``validate_sql`` (read-only, dataset allow-list,
+  LIMIT), the DECLAREs may only carry plain literals (no sub-queries, no
+  expressions). Only project code (providers/haruko_eod.py) calls it; the
+  ``query_desk_data`` tool keeps using the strict single-statement ``query``.
 
 Access model (verified 2026-09-10): the user has ``bigquery.tables.getData`` on
 ``anc-global-markets.brokerage_a1`` and ``anc-global-markets.pricing`` only, and
@@ -67,6 +75,20 @@ _TABLE_REF_RE = re.compile(
 # hyphen) anywhere in the text - catches refs hidden in table functions etc.
 _PROJECT_REF_RE = re.compile(r"\b(" + _IDENT + r"-" + _IDENT + r")\.(" + _IDENT + r")\.(" + _IDENT + r")\b")
 _TRAILING_LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+)(\s+OFFSET\s+\d+)?\s*$", re.IGNORECASE)
+
+
+# DECLARE statements tolerated by validate_declare_script: a plain literal default only.
+_DECLARE_TYPES = r"(?:TIME|DATE|DATETIME|TIMESTAMP|STRING|INT64|FLOAT64|NUMERIC|BIGNUMERIC|BOOL)"
+_DECLARE_LITERAL = (
+    r"(?:(?:TIME|DATE|DATETIME|TIMESTAMP)\s*)?'[^'\\;]*'"   # (typed) string literal, no ; or escapes
+    r"|-?\d+(?:\.\d+)?"                                    # number
+    r"|TRUE|FALSE"
+)
+_DECLARE_STMT_RE = re.compile(
+    r"^\s*DECLARE\s+([A-Za-z_][A-Za-z0-9_]*)\s+(" + _DECLARE_TYPES + r")\s+DEFAULT\s+(" + _DECLARE_LITERAL + r")\s*;",
+    re.IGNORECASE,
+)
+_DECLARE_START_RE = re.compile(r"^\s*DECLARE\b", re.IGNORECASE)
 
 
 class SQLGuardError(ValueError):
@@ -198,6 +220,66 @@ def validate_sql(sql: str, data_project: str, allowed_datasets: Sequence[str], m
     return body
 
 
+def split_declare_script(sql: str) -> Tuple[List[Tuple[str, str, str]], str]:
+    """Split ``DECLARE a T DEFAULT lit; ... <query>`` into ([(name, type, literal)], query).
+
+    Leading comments are skipped. Raises SQLGuardError when a DECLARE does not have
+    the exact ``DECLARE name TYPE DEFAULT <literal>;`` shape (no sub-queries, no
+    expressions, no untyped / default-less variables, no SET).
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        raise SQLGuardError("Empty SQL.")
+    # drop leading comments so the header of sql/*.sql files is not mistaken for code
+    rest = sql
+    while True:
+        stripped = rest.lstrip()
+        if stripped.startswith("--"):
+            nl = stripped.find("\n")
+            rest = "" if nl < 0 else stripped[nl + 1:]
+            continue
+        if stripped.startswith("/*"):
+            end = stripped.find("*/")
+            if end < 0:
+                raise SQLGuardError("Unterminated comment.")
+            rest = stripped[end + 2:]
+            continue
+        rest = stripped
+        break
+    declares: List[Tuple[str, str, str]] = []
+    while _DECLARE_START_RE.match(rest):
+        m = _DECLARE_STMT_RE.match(rest)
+        if not m:
+            head = rest.strip().splitlines()[0][:80] if rest.strip() else ""
+            raise SQLGuardError(
+                "DECLARE statements must have the form 'DECLARE name TYPE DEFAULT <literal>;' "
+                f"(plain literal only): {head!r}")
+        declares.append((m.group(1), m.group(2).upper(), m.group(3)))
+        rest = rest[m.end():]
+    return declares, rest
+
+
+def validate_declare_script(sql: str, data_project: str, allowed_datasets: Sequence[str], max_rows: int) -> str:
+    """Guard for the narrow 'DECLARE literals + one SELECT/WITH' script shape.
+
+    Every DECLARE must be ``DECLARE name TYPE DEFAULT <literal>;`` and the remainder
+    must pass :func:`validate_sql` unchanged (single read-only SELECT / WITH, every
+    table in an allowed dataset of ``data_project``, trailing LIMIT <= ``max_rows``).
+    Returns the re-assembled script. Never weakens the dataset allow-list or the
+    read-only rule: DML/DDL after the DECLAREs is refused exactly as before.
+    """
+    declares, body = split_declare_script(sql)
+    if not body.strip():
+        raise SQLGuardError("A DECLARE script must end with exactly one SELECT / WITH query.")
+    safe_body = validate_sql(body, data_project, allowed_datasets, max_rows)
+    if not declares:
+        return safe_body
+    names = [d[0].lower() for d in declares]
+    if len(set(names)) != len(names):
+        raise SQLGuardError("Duplicate DECLARE variable names.")
+    header = "\n".join(f"DECLARE {n} {t} DEFAULT {lit};" for n, t, lit in declares)
+    return f"{header}\n{safe_body}"
+
+
 def _strip_trailing_comments(sql: str) -> str:
     """Drop trailing -- comments / whitespace so LIMIT detection sees the real end."""
     lines = sql.rstrip().splitlines()
@@ -230,7 +312,7 @@ class DeskBigQuery:
         data_project: str = "anc-global-markets",
         billing_project: str = "anchorage-corp-eng-playground",
         allowed_datasets: Iterable[str] = ("brokerage_a1", "pricing"),
-        max_bytes_billed: int = 2_000_000_000,
+        max_bytes_billed: int = 20_000_000_000,
         max_rows: int = 200,
         timeout_s: int = 60,
         catalog_path: str | Path = "data/bq_catalog.json",
@@ -318,14 +400,33 @@ class DeskBigQuery:
     def query(self, sql: str) -> pd.DataFrame:
         """Run a guarded read-only query and return a DataFrame (Decimal -> float).
 
-        ``df.attrs['bytes_processed']`` and ``df.attrs['sql']`` are set for callers
-        that want to report cost.
+        ``df.attrs['bytes_processed']``, ``df.attrs['cache_hit']`` and
+        ``df.attrs['sql']`` are set for callers that want to report cost.
         """
-        safe = self.validate(sql)
+        return self._run(self.validate(sql), self.timeout_s)
+
+    def validate_script(self, sql: str, max_rows: Optional[int] = None) -> str:
+        """Guard for project-owned 'DECLARE literals + one SELECT' scripts (see module doc)."""
+        return validate_declare_script(sql, self.data_project, self.allowed_datasets,
+                                       int(max_rows) if max_rows else self.max_rows)
+
+    def query_script(self, sql: str, *, max_rows: Optional[int] = None,
+                     timeout_s: Optional[int] = None) -> pd.DataFrame:
+        """Run a ``DECLARE ... DEFAULT <literal>; ... SELECT`` script under the same guards.
+
+        Same cost cap, dataset allow-list and read-only rule as :meth:`query`; the
+        row cap (``max_rows``) and timeout may be raised per call because the
+        sanctioned scripts return one row per day and take ~45 s. Not reachable
+        from the LLM's ``query_desk_data`` tool.
+        """
+        safe = self.validate_script(sql, max_rows)
+        return self._run(safe, int(timeout_s) if timeout_s else self.timeout_s)
+
+    def _run(self, safe: str, timeout_s: int) -> pd.DataFrame:
         logger.debug("BigQuery query (billing=%s): %s", self.billing_project, safe)
-        job = self.client.query(safe, job_config=self._job_config(), timeout=self.timeout_s)
+        job = self.client.query(safe, job_config=self._job_config(), timeout=timeout_s)
         try:
-            result = job.result(timeout=self.timeout_s)
+            result = job.result(timeout=timeout_s)
         except Exception as e:  # surface permission problems clearly
             raise _friendly_error(e, self.billing_project, self.allowed_datasets) from e
         df = result.to_dataframe(create_bqstorage_client=False)
@@ -333,6 +434,8 @@ class DeskBigQuery:
         processed = getattr(job, "total_bytes_processed", None)
         self.last_bytes_processed = int(processed) if processed is not None else None
         df.attrs["bytes_processed"] = self.last_bytes_processed
+        cache_hit = getattr(job, "cache_hit", None)
+        df.attrs["cache_hit"] = bool(cache_hit) if cache_hit is not None else None
         df.attrs["sql"] = safe
         return df
 
@@ -511,6 +614,8 @@ __all__ = [
     "SQLGuardError",
     "format_bytes",
     "referenced_tables",
+    "split_declare_script",
     "strip_sql_noise",
+    "validate_declare_script",
     "validate_sql",
 ]

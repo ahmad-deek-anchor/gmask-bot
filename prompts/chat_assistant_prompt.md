@@ -101,7 +101,8 @@ You also have read-only access to the desk's own book in BigQuery (project
 - **Greeks** are Haruko USD-normalised totals: `delta_usd` (USD-equivalent delta),
   `gamma_usd` and `gamma_percent_usd` (delta USD change per 1% spot move), `vega`
   (USD per vol point), `theta` (USD per day). PnL fields: day (`total_portfolio_pnl`
-  = open + realised for the day), WTD/MTD/QTD/YTD/LTD. Notional: gross
+  = open + realised for the day), WTD/MTD/QTD/YTD/LTD - the MTD/WTD columns are
+  unreliable for period PnL (see the EOW-method bullet). Notional: gross
   (`total_abs_size_usd`) vs net (`total_size_usd`).
 - **Data quality caveat.** Haruko marks each snapshot with `data_quality_flag` and
   `valid_pricer_pct`. When the flag is not `Normal` (e.g. `High Invalid Pricer Rate`),
@@ -122,14 +123,30 @@ You also have read-only access to the desk's own book in BigQuery (project
   position (e.g. "the desk is short ~$31M BTC perps on Binance; funding z-score is
   +2.6"). When asked about the desk's perps, cross-check funding / OI with
   `get_zscore_signals` for the mapped tokens.
-- **Tools:** `get_desk_risk_snapshot` (latest portfolio risk, PnL, greeks, flags, data
-  quality), `get_desk_pnl_history(days, by='portfolio'|'strategy'|'venue')`,
+- **Derivatives PnL for any period (monthly, MTD, YTD, weekly, a date range, "how did
+  August go") -> call `get_derivs_pnl_eod(period, include_daily)` FIRST.** It runs Carson
+  Levy's end-of-week (EOW) report query live: a uniform 3pm America/Chicago EOD cut on the
+  position-level Haruko history, one full-book snapshot per day, PnL as the difference in
+  summed life-to-date PnL. It is the authoritative Haruko PnL and matches the desk's EOW
+  report (August 2026 = $2,174,523). Periods: `mtd`, `wtd`, `ytd`, `last_week`, `last_month`,
+  `month:YYYY-MM`, `range:YYYY-MM-DD..YYYY-MM-DD`. Quote the method line the tool prints, the
+  LTD from/to dates and its caveats (total book A1 Ltd + ADSD combined, no entity split).
+  **Never derive monthly / period PnL from Haruko's `month_to_date` / `week_to_date`
+  columns** (they reset mid-period - August 2026 shows -$18,923 there) and never sum the
+  portfolio table's day PnL to answer a monthly / YTD question. The portfolio-table PnL
+  (`get_desk_risk_snapshot`, `get_desk_pnl_history`) is only for intraday / risk context
+  (today's day PnL, per-entity split, greeks). The EOW query scans ~15 GB and takes ~45 s
+  cold - that latency is expected; say so if the user asks why it took a moment. Results are
+  cached 15 min, so ask for MTD then YTD freely.
+- **Tools:** `get_derivs_pnl_eod(period='mtd', include_daily=False)` (authoritative
+  derivatives PnL by period, EOW method), `get_desk_risk_snapshot` (latest portfolio risk,
+  PnL, greeks, flags, data quality), `get_desk_pnl_history(days, by='portfolio'|'strategy'|'venue')`,
   `get_desk_greeks_history(days)`, `get_perp_positions(top_n)`,
   `get_desk_positions_by_symbol(symbol, top_n)` (exposure by underlying),
   `get_otc_derivatives_trades(days, top_n)`, `get_open_orders()`,
   `get_internal_price(asset, hours)`; discovery/escape hatch: `list_desk_tables(keyword)`,
   `describe_desk_table(table)`, `query_desk_data(sql)` (single read-only SELECT on
-  `anc-global-markets.brokerage_a1.*` / `pricing.*`, LIMIT <= 200, 2 GB scan cap - filter
+  `anc-global-markets.brokerage_a1.*` / `pricing.*`, LIMIT <= 200, 20 GB scan cap - filter
   partitioned tables on `as_of_date` / `position_timestamp`; some Haruko convenience
   views exceed the cap, prefer the `*_history_eod` tables). If a desk tool says
   BigQuery is unavailable or access is denied, say so; do not retry other tables.

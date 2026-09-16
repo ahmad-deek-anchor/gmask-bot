@@ -1,7 +1,7 @@
 """Access control for the Slack bot: roles -> tool groups, places, and the tool wrapper that
 enforces them at execution time.
 
-    policy   = Policy.load("deploy/access-policy.yaml")        # static: roles, tool groups, messages
+    policy   = Policy.load("access/policy.yaml")                # static: roles, tool groups, messages
     store    = open_access_store()                              # dynamic: users, channels, settings
     control  = AccessControl(policy, store)
     decision = control.decide(user_id, channel_id, is_dm)       # role + place for one message
@@ -29,7 +29,7 @@ from tools import context as _ctx
 logger = logging.getLogger(__name__)
 audit = logging.getLogger("access.audit")
 
-DEFAULT_POLICY_PATH = Path(__file__).resolve().parent.parent / "deploy" / "access-policy.yaml"
+DEFAULT_POLICY_PATH = Path(__file__).resolve().parent / "policy.yaml"   # shipped with the package (deploy/ is not in the image)
 ROLE_ORDER = ("none", "viewer", "desk", "lead", "admin")
 CHANNEL_MODES = ("allowed", "confidential")
 UNGATED_TOOLS = {"current_time"}      # utility tools outside every group

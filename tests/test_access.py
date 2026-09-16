@@ -15,7 +15,7 @@ from access.store import MemoryAccessStore, SqliteAccessStore
 from slack_bot import RecordingClient, handle
 from tools import context as ctx
 
-ADMIN = "U0BP6EUTHA9"          # bootstrap admin in deploy/access-policy.yaml
+ADMIN = "U0BP6EUTHA9"          # bootstrap admin in access/policy.yaml
 
 
 @pytest.fixture

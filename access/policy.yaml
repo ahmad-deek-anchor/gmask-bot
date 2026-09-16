@@ -1,6 +1,7 @@
 # Access policy for the GM Slack bot - the STATIC part (roles, tool groups, messages).
 #
-# Enforced by access/policy.py: loaded at start-up from ACCESS_POLICY_PATH (default this file).
+# Enforced by access/policy.py: loaded at start-up from ACCESS_POLICY_PATH (default this file,
+# access/policy.yaml - it lives inside the package so the Cloud Run image always carries it).
 # The DYNAMIC part - which users hold which role, which channels the bot answers in, the default
 # role and the pause switch - lives in the access store (BigQuery table gmask_bot.access on Cloud
 # Run, sqlite data/access.db locally) and is edited from Slack by admins:

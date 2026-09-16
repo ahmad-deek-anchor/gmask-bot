@@ -40,7 +40,7 @@ SNAPSHOT_BQ_TABLE     env SNAPSHOT_BQ_TABLE    (default anchorage-corp-eng-playg
 
 Access control for the Slack bot (access/):
 ACCESS_CONTROL        env ACCESS_CONTROL       (default on; off = every Slack user gets every tool)
-ACCESS_POLICY_PATH    env ACCESS_POLICY_PATH   (default deploy/access-policy.yaml; roles, tool groups, bootstrap admins)
+ACCESS_POLICY_PATH    env ACCESS_POLICY_PATH   (default access/policy.yaml; roles, tool groups, bootstrap admins)
 ACCESS_BACKEND        env ACCESS_BACKEND       (default = SNAPSHOT_BACKEND: sqlite locally, bigquery on Cloud Run)
 ACCESS_DB_PATH        env ACCESS_DB_PATH       (default data/access.db; sqlite backend)
 ACCESS_BQ_TABLE       env ACCESS_BQ_TABLE      (default anchorage-corp-eng-playground.gmask_bot.access)

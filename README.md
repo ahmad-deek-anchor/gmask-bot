@@ -637,7 +637,7 @@ network, no GCP.
 Added 2026-09-16 (`access/`). Every Slack message is checked before the agent runs, and every
 tool call is re-checked when it executes, against a two-part policy:
 
-- **Static** (`deploy/access-policy.yaml`, loaded at start-up): the roles and what they may use
+- **Static** (`access/policy.yaml`, loaded at start-up): the roles and what they may use
   (`viewer` = public market data, live prices, news / sectors, ETF, CME, macro, public snapshots,
   personal memory; `desk` = + the full written report, Haruko risk / PnL / positions, the spot PnL
   sheet incl. counterparty PnL; `lead` = + raw BigQuery discovery and SQL, shared memory, channel

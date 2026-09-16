@@ -47,7 +47,7 @@ gcloud run jobs deploy "${JOB}" \
   --project "${PROJECT}" --region "${REGION}" \
   --service-account "${SA}" \
   --command python \
-  --args "snapshot_daily.py,--sources,${SOURCES},--verbose" \
+  --args "^|^snapshot_daily.py|--sources|${SOURCES}|--verbose" \
   --set-env-vars "${ENV_VARS}" \
   --task-timeout 20m \
   --max-retries 1 \

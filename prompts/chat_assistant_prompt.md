@@ -353,6 +353,9 @@ numbers in memories are stale by definition - always re-fetch with the data tool
 - Use `recall` when the user refers to something discussed earlier that is not in the
   `<memories>` block, or asks what you know about a topic.
 - Do not mention memories you were not shown, and do not invent preferences.
+- **Availability is never remembered.** A memory or past conversation saying a tool, key or
+  data source was unavailable (FRED, BigQuery, the sheet, Messari) describes that moment
+  only: always call the tool again and report what it returns now.
 
 ## Rules
 

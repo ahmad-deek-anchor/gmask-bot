@@ -1,0 +1,193 @@
+# DRAFT - access policy for the GM Slack bot (not enforced yet; see deploy/access-control.md once built).
+#
+# Where it lives: Secret Manager secret `gm_bot_access_policy` in anchorage-trading-solutions (YAML,
+# this shape), re-read every `refresh_seconds` by the running bot so membership changes need no
+# redeploy. Locally, ACCESS_POLICY_PATH=deploy/access-policy.yaml overrides the secret.
+#
+# Evaluation order for every Slack event:
+#   1. kill_switch            -> polite "paused" reply, nothing runs
+#   2. place                  -> channel must be listed (or DMs enabled); otherwise denied_message
+#   3. role                   -> users.by_id, then Slack user groups, then default_role
+#   4. tool set               -> union of the role's tool_groups (plus inherited roles); the agent is
+#                                built with exactly those tools, and every tool call is re-checked
+#                                against this policy at execution time (the wrapper is the control)
+#   5. place sensitivity      -> groups listed under confidential_groups run only in confidential
+#                                places (private channels below, or a DM from a user holding the role)
+#   6. argument rules         -> a few tools branch on an argument (memory scope, snapshot source)
+#   7. limits + audit         -> per-user / per-channel daily counters; every call logged
+
+version: 1
+refresh_seconds: 300
+kill_switch: false
+
+# Role for a user who matches nothing below. "none" = the bot ignores them (recommended while the
+# desk data grant is pending); "viewer" would open public market data to the whole workspace.
+default_role: none
+
+messages:
+  denied_place: "I'm not enabled in this channel. Ask Ahmad to add it, or DM me."
+  denied_role: "You're not on the GM bot access list yet. Ask Ahmad or a GM lead to add you."
+  denied_tool: "That data is limited to the GM desk in private channels. Here is what I can share instead:"
+  paused: "The GM bot is paused for maintenance."
+
+# ---------------------------------------------------------------------------------------------
+# Roles: each inherits the tool groups of the role it names in `inherits`.
+# ---------------------------------------------------------------------------------------------
+roles:
+  viewer:
+    description: Public market data, news, sectors, ETF flows, CME, macro; personal memory only.
+    tool_groups: [market, live, news, etf, cme, macro, snapshots, memory_personal]
+
+  desk:
+    description: GM desk staff - adds the desk's own risk, PnL, positions and the spot PnL sheet.
+    inherits: viewer
+    tool_groups: [market_heavy, desk_risk, spot_pnl]
+
+  lead:
+    description: Desk leads - adds raw table access, counterparty-level PnL, shared memory and channel rules.
+    inherits: desk
+    tool_groups: [desk_raw, spot_counterparty, memory_shared]
+
+  admin:
+    description: Ahmad - everything, plus policy changes (via Secret Manager IAM, not the bot).
+    inherits: lead
+    tool_groups: []
+
+# Groups whose tools return internal positions, PnL, counterparties or raw cells.
+confidential_groups: [desk_risk, desk_raw, spot_pnl, spot_counterparty]
+
+# ---------------------------------------------------------------------------------------------
+# Tool groups (names are the registered LangChain tool names - see chat.default_tools()).
+# ---------------------------------------------------------------------------------------------
+tool_groups:
+  market:            # Coin Metrics + Amberdata daily data, z-scores, options analytics (Deribit)
+    - list_token_universe
+    - list_top_assets
+    - get_token_metrics
+    - get_zscore_signals
+    - get_price_history
+    - get_multi_day_signals_tool
+    - get_options_snapshot
+    - get_vol_term_structure
+    - get_options_flow
+    - get_gamma_exposure
+  market_heavy:      # slow / expensive: the full written report (~minutes, many API + model calls)
+    - run_full_signals_analysis
+  live:              # Coin Metrics live trades, quotes, intraday candles
+    - get_live_price
+    - get_intraday_candles
+    - get_recent_trades
+  news:              # Messari news, taxonomy, Intel, social signals
+    - get_crypto_news
+    - classify_tokens
+    - get_sector_members
+    - list_crypto_sectors
+    - get_intel_events
+    - get_social_signals
+  etf:               # Messari / Blockworks ETF tables + Coin Metrics on-chain BTC ETF flows
+    - get_etf_overview
+    - get_etf_flows
+    - get_btc_etf_onchain_flows
+  cme:               # Coin Metrics CME futures
+    - get_cme_curve
+    - get_cme_open_interest
+  macro:             # FRED
+    - get_macro_snapshot
+    - get_fred_series
+    - search_fred
+  snapshots:         # daily snapshot history; the `source` argument decides sensitivity (see argument_rules)
+    - get_snapshot_history
+    - compare_to_snapshot
+    - list_snapshot_metrics
+  desk_risk:         # Haruko / BigQuery: positions, greeks, PnL, perps, OTC trades, orders, internal prices
+    - get_desk_risk_snapshot
+    - get_desk_pnl_history
+    - get_derivs_pnl_eod
+    - get_desk_greeks_history
+    - get_perp_positions
+    - get_desk_positions_by_symbol
+    - get_otc_derivatives_trades
+    - get_open_orders
+    - get_internal_price
+  desk_raw:          # discovery + arbitrary read-only SQL on the two desk datasets
+    - list_desk_tables
+    - describe_desk_table
+    - query_desk_data
+  spot_pnl:          # A1 Metrics Dashboard sheet: HOLD / A1 PnL, take rate, financing fees, client-flow split
+    - get_spot_pnl_summary
+    - get_weekly_spot_pnl
+    - get_financing_fees
+    - get_nonclient_pnl
+    - get_a1_client_flow_split
+    - list_a1_dashboard_tabs
+  spot_counterparty: # names counterparties, or dumps raw cells
+    - get_counterparty_pnl
+    - read_a1_dashboard_range
+  memory_personal:   # a user's own memories (scope "me") - the memory store already isolates users
+    - remember
+    - recall
+    - forget
+    - what_do_you_remember
+  memory_shared:     # desk-wide facts and channel standing instructions
+    - set_channel_rule
+    - clear_channel_rule
+
+# Tools whose sensitivity depends on an argument. The wrapper checks these after the group check.
+argument_rules:
+  - tool: remember
+    argument: scope
+    values: [shared]
+    requires_group: memory_shared          # scope "me" stays under memory_personal
+  - tool: forget
+    argument: scope
+    values: [shared]
+    requires_group: memory_shared
+  - tools: [get_snapshot_history, compare_to_snapshot, list_snapshot_metrics]
+    argument: source
+    values: [haruko, sheet]
+    requires_group: desk_risk               # signals / etf / cme snapshots stay public
+    confidential: true                      # and only in confidential places
+
+# ---------------------------------------------------------------------------------------------
+# Principals. Slack user ids are stable; user groups are resolved with usergroups.users.list
+# (needs the usergroups:read scope) and cached for refresh_seconds. First match wins in the
+# order: users.by_id, slack_user_groups, google_groups (email via users.info), default_role.
+# ---------------------------------------------------------------------------------------------
+principals:
+  users:
+    by_id:
+      U00AHMAD: admin            # Ahmad Deek (replace with the real Slack user id)
+  slack_user_groups:
+    gm-leads: lead               # @gm-leads
+    gm-desk: desk                # @gm-desk
+    gm-readers: viewer           # sales / research / management who may see market data
+  google_groups: {}              # optional: e.g. data-access-a1-trading-solutions@anchorlabs.com: desk
+
+# ---------------------------------------------------------------------------------------------
+# Places. A channel not listed is denied outright when deny_unlisted_channels is true.
+# Confidential tool groups run only in `confidential` channels or in DMs.
+# ---------------------------------------------------------------------------------------------
+places:
+  deny_unlisted_channels: true
+  channels:
+    allowed:
+      - C0BV4T93BT3              # #gm-signals (daily post channel) - replace / extend
+    confidential:
+      - C0GMDESKPRIV             # private #gm-desk channel (replace)
+  dms:
+    enabled: true
+    min_role: viewer
+    confidential_allowed: true   # a desk-role user may ask for positions in a DM
+
+# ---------------------------------------------------------------------------------------------
+# Limits and audit.
+# ---------------------------------------------------------------------------------------------
+limits:
+  per_user_daily_requests: 150
+  per_channel_daily_requests: 1000
+  exempt_roles: [admin]
+
+audit:
+  bigquery_table: anchorage-corp-eng-playground.gmask_bot.audit
+  log_arguments: redacted        # none | redacted (tool + argument names) | full (values too)
+  retain_days: 400

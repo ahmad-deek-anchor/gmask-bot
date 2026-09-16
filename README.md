@@ -161,6 +161,30 @@ Values are the latest complete UTC day.
 Token-level notes: `pol` is Coin Metrics asset `pol` (the old `matic` markets are dead);
 `sky` is `sky_sky` (`sky` is Skycoin). Both are mapped in `providers/coinmetrics.py`.
 
+## Live and intraday prices (Coin Metrics market data)
+
+Added 2026-09-16. The Coin Metrics key has full, undelayed access to the market-level
+endpoints: 1-minute candles land about a minute after the bar closes, market trades and
+top-of-book quotes are live. Asset-level reference rates (`ReferenceRateUSD`) are forbidden
+on the key at every frequency, so "live price" means the token's primary spot market
+(Coinbase USD first, then the fallbacks in `providers/coinmetrics.py`), not an index. The
+tools say which market and timestamp every number came from.
+
+Provider (`providers/coinmetrics.py`): `get_intraday_candles(token, frequency, lookback_minutes)`
+(1m, 5m, 10m, 15m, 30m, 1h, 4h; max one week), `get_latest_trade(token)`, `get_latest_quote(token)`,
+`get_recent_trades(token, minutes)` (max 60 minutes). Tools (`tools/intraday_tools.py`,
+registered by `chat.default_tools()` right after the market-data tools):
+
+| Tool | What it answers |
+|---|---|
+| `get_live_price(token)` | "what is BTC trading at": last trade, bid/ask + spread, last 1m bar, 1h and 24h change, 24h high/low/volume on the market |
+| `get_intraday_candles(token, frequency="5m", lookback_minutes=180)` | intraday bars with open/high/low/last/change/volume/VWAP; tables longer than 48 bars print the summary plus the last 48 |
+| `get_recent_trades(token, minutes=5, min_trade_usd=50000)` | the tape: count, taker buy vs sell notional, VWAP, largest prints |
+
+Tests: `tests/test_intraday_tools.py` (fake client, no network). Live check 2026-09-16 13:25 UTC:
+BTC last trade 3 s old, quote 8 s old, 1m bar 1 min old; a full `get_live_price` call takes
+~0.3 s warm (about 5 s on the first call while the client initialises).
+
 ## Options (Deribit via Amberdata)
 
 `providers/amberdata_options.py` (`AmberdataOptionsProvider`, built by

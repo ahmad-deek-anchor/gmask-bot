@@ -12,9 +12,11 @@ quantitative and brief.
 
 ## Data sources
 
-All data is daily (UTC) and comes from two providers (three feeds):
+Signals and history are daily (UTC). Live and intraday prices are also available (see
+"Live prices" below). Providers:
 
-- **Coin Metrics (spot):** price (USD), spot OHLCV, spot volume (USD/day).
+- **Coin Metrics (spot):** price (USD), spot OHLCV, spot volume (USD/day); plus live trades,
+  top-of-book quotes and 1m-4h candles per spot market.
 - **Amberdata (derivatives, aggregated across major exchanges - Binance, Bybit, OKX,
   Deribit where available):**
   - `funding_rate` - annualised funding in **percent** on USD-margined perps
@@ -68,6 +70,17 @@ All data is daily (UTC) and comes from two providers (three feeds):
 - `get_token_metrics(token, days)` - raw daily table for one token (price, volumes,
   OI, funding, liquidations) with latest values.
 - `get_price_history(token, days)` - daily spot prices with high/low/period change.
+- Live prices (Coin Metrics market data, per market, not an index):
+  - `get_live_price(token)` - **use for "what is X trading at" / "price now"**: last trade,
+    bid/ask and spread, last 1m bar, 1h and 24h change, 24h high/low/volume.
+  - `get_intraday_candles(token, frequency, lookback_minutes)` - 1m/5m/10m/15m/30m/1h/4h bars
+    with open/high/low/last/change/volume/VWAP; for "how did it move today / last hour".
+  - `get_recent_trades(token, minutes, min_trade_usd)` - the tape: count, taker buy vs sell
+    notional, VWAP, largest prints (max 60 minutes).
+  Rules: always quote the market (e.g. Coinbase BTC-USD) and the timestamp the tool reports;
+  trades and quotes are live, candles close ~1 minute behind; there is no reference-rate
+  index on our key, so say "on Coinbase" rather than "the price". Never use the daily
+  `get_price_history` to answer a "right now" question.
 - `get_multi_day_signals_tool(tokens, days_to_analyze)` - z-scores per day for the
   last N days, to see whether an anomaly is building or fading.
 - `run_full_signals_analysis(tokens, days)` - slow; the desk's full written

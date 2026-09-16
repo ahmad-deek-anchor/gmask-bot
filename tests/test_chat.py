@@ -257,12 +257,17 @@ def test_default_tools_include_desk_tools():
     from tools.memory_tools import MEMORY_TOOL_NAMES
     from tools.sheet_tools import SHEET_TOOL_NAMES
 
+    from tools.intraday_tools import get_intraday_tools
+
     names = [t.name for t in chat.default_tools()]
-    n_chat, n_desk, n_sheet = len(get_chat_tools()), len(DESK_TOOL_NAMES), len(SHEET_TOOL_NAMES)
+    intraday = [t.name for t in get_intraday_tools()]
+    n_chat, n_intra, n_desk, n_sheet = len(get_chat_tools()), len(intraday), len(DESK_TOOL_NAMES), len(SHEET_TOOL_NAMES)
     assert names[:n_chat] == [t.name for t in get_chat_tools()]
-    assert names[n_chat:n_chat + n_desk] == DESK_TOOL_NAMES
-    assert names[n_chat + n_desk:n_chat + n_desk + n_sheet] == SHEET_TOOL_NAMES
-    n_fixed = n_chat + n_desk + n_sheet
+    assert names[n_chat:n_chat + n_intra] == intraday
+    n_after_intra = n_chat + n_intra
+    assert names[n_after_intra:n_after_intra + n_desk] == DESK_TOOL_NAMES
+    assert names[n_after_intra + n_desk:n_after_intra + n_desk + n_sheet] == SHEET_TOOL_NAMES
+    n_fixed = n_after_intra + n_desk + n_sheet
     assert names[n_fixed:n_fixed + len(MEMORY_TOOL_NAMES)] == MEMORY_TOOL_NAMES
     # snapshot tools are optional: registered only when tools/snapshot_tools.py exists
     try:

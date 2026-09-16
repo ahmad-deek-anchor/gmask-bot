@@ -8,11 +8,24 @@ Spot price resolution order
 ---------------------------
 1. asset metric PriceUSD              (not offered for several small-cap assets)
 2. daily candle price_close from the token's spot markets (works for all)
-3. asset metric ReferenceRateUSD      (trial key returns 403; treated as no data)
+3. asset metric ReferenceRateUSD      (returns 403 on our key at every frequency; treated as no data)
+
+Intraday / live data (added 2026-09-16)
+---------------------------------------
+The key has full access to the market-level endpoints, and they are not delayed: 1-minute
+candles land ~1 minute after the bar closes, market trades and top-of-book quotes are
+live. Asset-level reference rates (ReferenceRateUSD) are forbidden at every frequency, so
+"live price" means the latest trade / quote on the token's primary spot market (Coinbase
+USD first, then the fallbacks in EXCHANGE_AVAILABILITY / DEFAULT_EXCHANGES), not an index.
+
+    get_intraday_candles(token, frequency, lookback_minutes)  OHLCV bars, 1m .. 4h
+    get_latest_trade(token)                                   last print: time, price, amount, side
+    get_latest_quote(token)                                   top of book: bid / ask, sizes, time
+    get_recent_trades(token, minutes)                         the tape for the last N minutes
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -48,6 +61,12 @@ DEFAULT_EXCHANGES = [
 
 TOKENS_WITHOUT_LIQUIDATIONS = {"fluid", "morpho", "pendle", "pump"}
 
+# Candle frequencies the market-candles endpoint serves below daily (catalog_market_candles_v2,
+# checked 2026-09-16 for coinbase-btc-usd-spot). "1d" is handled by the daily methods above.
+INTRADAY_FREQUENCIES = ("1m", "5m", "10m", "15m", "30m", "1h", "4h")
+MAX_INTRADAY_LOOKBACK_MIN = 7 * 24 * 60   # one week of bars per call is plenty for a chat answer
+MAX_TAPE_MINUTES = 60                     # market trades: cap the tape window at an hour
+
 
 def asset_id_for(token: str) -> str:
     """Map a token symbol to its Coin Metrics asset id."""
@@ -65,6 +84,17 @@ def _normalize_time(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None).dt.normalize()
     return df.sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
+
+
+def _normalize_intraday_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce `time` to tz-aware UTC datetime64 (no day normalisation), sorted ascending."""
+    df = df.copy()
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    return df.sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
+
+
+def _utc_iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class CoinMetricsProvider(MarketDataProvider):
@@ -172,6 +202,128 @@ class CoinMetricsProvider(MarketDataProvider):
             return df.rename(columns={"ReferenceRateUSD": "price"})
 
         logger.debug(f"CoinMetrics: no spot price for {token}")
+        return None
+
+    # ------------------------------------------------------------------
+    # Intraday / live (market-level endpoints; see module docstring)
+    # ------------------------------------------------------------------
+
+    def _markets(self, token: str, market: Optional[str]) -> list[str]:
+        return [market] if market else spot_markets_for(token)
+
+    def get_intraday_candles(
+        self, token: str, frequency: str = "5m", lookback_minutes: int = 180, market: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
+        """OHLCV bars for the token's primary spot market (first market that returns data).
+
+        Columns: time (UTC, tz-aware), open, high, low, close, vwap, volume (base units),
+        usd_volume, trades. ``df.attrs["market"]`` names the market the bars came from.
+        Returns None when the frequency is unsupported or no market returns data.
+        """
+        if frequency not in INTRADAY_FREQUENCIES:
+            logger.debug("CoinMetrics: unsupported intraday frequency %r", frequency)
+            return None
+        lookback_minutes = max(1, min(int(lookback_minutes), MAX_INTRADAY_LOOKBACK_MIN))
+        start = _utc_iso(datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes))
+        rename = {"price_open": "open", "price_high": "high", "price_low": "low", "price_close": "close",
+                  "candle_usd_volume": "usd_volume", "candle_trades_count": "trades"}
+        cols = ["time", "open", "high", "low", "close", "vwap", "volume", "usd_volume", "trades"]
+        for m in self._markets(token, market):
+            try:
+                df = self._client.get_market_candles(
+                    markets=[m], frequency=frequency, start_time=start, page_size=1000
+                ).to_dataframe()
+            except Exception as e:
+                logger.debug("CoinMetrics intraday candles failed for %s %s: %s: %s", m, frequency, type(e).__name__, e)
+                continue
+            if df is None or df.empty:
+                continue
+            df = _normalize_intraday_time(df.rename(columns=rename))
+            for c in cols[1:]:
+                if c not in df.columns:
+                    df[c] = pd.NA
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            out = df[cols].reset_index(drop=True)
+            out.attrs["market"] = m
+            out.attrs["frequency"] = frequency
+            return out
+        return None
+
+    def _latest_row(self, fetch, token: str, market: Optional[str], what: str) -> Optional[pd.DataFrame]:
+        """Newest row of a market endpoint (paging from the end), trying markets in order."""
+        for m in self._markets(token, market):
+            try:
+                df = fetch(m).to_dataframe()
+            except Exception as e:
+                logger.debug("CoinMetrics %s failed for %s: %s: %s", what, m, type(e).__name__, e)
+                continue
+            if df is None or df.empty:
+                continue
+            df = _normalize_intraday_time(df)
+            row = df.iloc[[-1]].reset_index(drop=True)
+            row.attrs["market"] = m
+            return row
+        return None
+
+    def get_latest_trade(self, token: str, market: Optional[str] = None) -> Optional[dict]:
+        """Last print on the token's primary spot market: {market, time, price, amount, side, usd}."""
+        row = self._latest_row(
+            lambda m: self._client.get_market_trades(markets=[m], paging_from="end", page_size=1, limit_per_market=1),
+            token, market, "latest trade",
+        )
+        if row is None:
+            return None
+        r = row.iloc[0]
+        price, amount = float(r["price"]), float(r["amount"])
+        return {"market": row.attrs["market"], "time": r["time"].to_pydatetime(), "price": price,
+                "amount": amount, "side": str(r.get("side", "")), "usd": price * amount}
+
+    def get_latest_quote(self, token: str, market: Optional[str] = None) -> Optional[dict]:
+        """Top of book on the token's primary spot market: {market, time, bid, ask, bid_size, ask_size, mid, spread_bp}."""
+        row = self._latest_row(
+            lambda m: self._client.get_market_quotes(markets=[m], paging_from="end", page_size=1, limit_per_market=1),
+            token, market, "latest quote",
+        )
+        if row is None:
+            return None
+        r = row.iloc[0]
+        bid, ask = float(r["bid_price"]), float(r["ask_price"])
+        mid = (bid + ask) / 2 if bid and ask else None
+        return {"market": row.attrs["market"], "time": r["time"].to_pydatetime(), "bid": bid, "ask": ask,
+                "bid_size": float(r.get("bid_size", float("nan"))), "ask_size": float(r.get("ask_size", float("nan"))),
+                "mid": mid, "spread_bp": ((ask - bid) / mid * 1e4) if mid else None}
+
+    def get_recent_trades(
+        self, token: str, minutes: int = 5, market: Optional[str] = None, max_rows: int = 20000
+    ) -> Optional[pd.DataFrame]:
+        """The tape for the last ``minutes`` on the token's primary spot market.
+
+        Columns: time (UTC), price, amount (base), side ('buy'/'sell' = taker side), usd.
+        ``df.attrs["market"]`` names the market. None when no market returns trades.
+        """
+        minutes = max(1, min(int(minutes), MAX_TAPE_MINUTES))
+        start = _utc_iso(datetime.now(timezone.utc) - timedelta(minutes=minutes))
+        for m in self._markets(token, market):
+            try:
+                df = self._client.get_market_trades(
+                    markets=[m], start_time=start, page_size=10000, limit_per_market=max_rows
+                ).to_dataframe()
+            except Exception as e:
+                logger.debug("CoinMetrics trades failed for %s: %s: %s", m, type(e).__name__, e)
+                continue
+            if df is None or df.empty:
+                continue
+            df = _normalize_intraday_time(df)
+            out = pd.DataFrame({
+                "time": df["time"],
+                "price": pd.to_numeric(df["price"], errors="coerce"),
+                "amount": pd.to_numeric(df["amount"], errors="coerce"),
+                "side": df["side"].astype(str) if "side" in df.columns else "",
+            })
+            out["usd"] = out["price"] * out["amount"]
+            out = out.dropna(subset=["price", "amount"]).reset_index(drop=True)
+            out.attrs["market"] = m
+            return out
         return None
 
     # ------------------------------------------------------------------

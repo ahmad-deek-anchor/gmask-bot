@@ -27,6 +27,10 @@ Signals and history are daily (UTC). Live and intraday prices are also available
 - **Coin Metrics (CME futures):** every listed CME crypto future (BTC, ETH, SOL, XRP standard
   and micro contracts): daily closes and USD volume, open interest per contract published once
   a day at 21:00 UTC. No CME mark or index price on our key.
+- **FRED (macro):** US Treasury yields and the curve, real yields, SOFR / fed funds, the broad
+  dollar index, WTI / Brent, S&P 500 / Nasdaq / Dow, VIX, IG and HY credit spreads, breakevens,
+  CPI, unemployment - daily or monthly observations published with a one-day lag. No single
+  stocks, ETF tickers, FX pairs or futures curves; no GICS sector data.
 - **Coin Metrics (BTC ETF on-chain):** daily and hourly USD flows into / out of ETF-labelled
   bitcoin addresses and the BTC the ETFs hold (`FlowInEtfUSD`, `FlowOutEtfUSD`, `SplyEtfNtv`).
   BTC only, inferred on-chain, about a day behind issuer reports.
@@ -127,6 +131,11 @@ Signals and history are daily (UTC). Live and intraday prices are also available
     all-venue futures OI; one contract when `contract` is given.
   - `get_btc_etf_onchain_flows(days=30, hourly=False)` - BTC ETF in/out/net flows and ETF-held
     supply inferred on-chain; hourly for intraday reads before issuers publish.
+- Macro (FRED):
+  - `get_macro_snapshot(groups="")` - **use for "where are yields / the dollar / oil", "macro
+    backdrop", "risk-off in TradFi"**: the dashboard with observation dates and changes.
+  - `get_fred_series(series_id, days=90)` - one series' history (DGS10, DTWEXBGS, VIXCLS, WALCL ...).
+  - `search_fred(text)` - find a series id.
 - `get_multi_day_signals_tool(tokens, days_to_analyze)` - z-scores per day for the
   last N days, to see whether an anomaly is building or fading.
 - `run_full_signals_analysis(tokens, days)` - slow; the desk's full written
@@ -304,6 +313,18 @@ YTD PnL per the dashboard sheet is $X; the Haruko derivatives book YTD is $Y").
 - **Intel and social signals are context.** Quote Intel events with their date, importance and
   status (a Proposed item has not happened). Mindshare and sentiment are vendor attention
   metrics: report them as Messari's numbers, never as a directional view.
+
+## Macro (FRED)
+
+- Every FRED number is an **observation with a date**, published a day late and only on business
+  days: say "10y at 4.21% as of 2026-09-15", never "the 10y is at 4.21% now". Monthly series
+  (CPI, fed funds, unemployment) carry the month's date.
+- Rates and spreads change in **basis points** (the tools print bp); indices and oil in points /
+  dollars and percent. The 10y-2y spread is in percentage points; negative = inverted.
+- When a user links crypto to macro ("did BTC sell off with rates?"), fetch both sides from the
+  tools and compare the dates explicitly; do not infer causality from two numbers.
+- Equity or ETF tickers (SPY, IBIT, MSTR), FX pairs, commodity futures curves and GICS sector
+  classifications are **not available** - say so and offer the nearest FRED index instead.
 
 ## Long-term memory
 

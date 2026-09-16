@@ -20,6 +20,9 @@ when google-auth cannot resolve Application Default Credentials.
 (news, sector taxonomy, ETF flows, Intel, signals), or None when no Messari key is
 configured.
 
+`get_fred_provider()` returns a process-wide providers.fred.FredProvider (macro series),
+or None when no FRED key is configured.
+
 There is no local cache; every call hits the upstream API. API keys come from
 utils.config.Config (env var override, else GCP Secret Manager).
 """
@@ -98,6 +101,7 @@ def reset_provider() -> None:
     _provider = None
     reset_options_provider()
     reset_messari_provider()
+    reset_fred_provider()
 
 
 _ORIGINAL_GET_PROVIDER = get_provider   # get_universe() compares against this to detect test doubles
@@ -285,6 +289,48 @@ def reset_messari_provider() -> None:
     with _messari_lock:
         _messari = None
         _messari_built = False
+
+
+# ----------------------------------------------------------------------
+# FRED (macro series)
+# ----------------------------------------------------------------------
+
+_fred = None
+_fred_built = False
+_fred_lock = threading.Lock()
+
+
+def get_fred_provider():
+    """Shared FredProvider, or None when no FRED key is available (memoised; reset_fred_provider() to retry)."""
+    global _fred, _fred_built
+    if _fred_built:
+        return _fred
+    with _fred_lock:
+        if _fred_built:
+            return _fred
+        prov = None
+        try:
+            from providers.fred import FredProvider
+            from utils.config import Config
+
+            key = Config().FRED_API_KEY
+            if not key:
+                logger.warning("No FRED API key (env FRED_API_KEY or secret fred_api_key); macro tools will be unavailable.")
+            else:
+                prov = FredProvider(key)
+                logger.info("Macro data provider: FRED")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("FRED provider unavailable: %s", e)
+        _fred = prov
+        _fred_built = True
+        return _fred
+
+
+def reset_fred_provider() -> None:
+    global _fred, _fred_built
+    with _fred_lock:
+        _fred = None
+        _fred_built = False
 
 
 # ----------------------------------------------------------------------

@@ -283,6 +283,32 @@ Tools (`tools/cme_tools.py`, registered after the Messari tools):
 
 Tests: `tests/test_cme.py` (fake client, no network).
 
+## Macro data (FRED)
+
+Added 2026-09-16. Traditional-finance data is FRED only for now (decision 2026-09-16): the Coin
+Metrics key is not entitled to its FMP / Databento equity and futures feeds and Stooq blocks API
+use, so equity / ETF tickers, FX pairs, commodity futures curves and GICS sector data wait for a
+vendor. `providers/fred.py` (`FredProvider`, key from secret `fred_api_key` or env `FRED_API_KEY`;
+create a free key at https://fred.stlouisfed.org/docs/api/api_key.html) wraps the FRED JSON API
+(120 requests / minute, `api_key` as a query parameter that is never logged) with retries and a
+15-minute memo. `MACRO_SERIES` is the curated dashboard: DGS2 / DGS10 / DGS30, T10Y2Y, DFII10,
+SOFR, FEDFUNDS, DTWEXBGS (broad dollar), DCOILWTICO / DCOILBRENTEU, SP500 / NASDAQCOM / DJIA,
+VIXCLS, BAMLH0A0HYM2 / BAMLC0A0CM (HY / IG OAS), T5YIE / T10YIE, CPIAUCSL, UNRATE. FRED's LBMA gold
+series was discontinued, so gold is not on the dashboard (search_fred finds alternatives).
+
+Tools (`tools/macro_tools.py`, registered after the CME tools):
+
+| Tool | What it answers |
+|---|---|
+| `get_macro_snapshot(groups="")` | the dashboard by group (rates, fx, commodities, equities, volatility, credit, inflation, labour) with observation date and change vs prior print / 1w / 1m (bp for rates and spreads) |
+| `get_fred_series(series_id, days=90)` | one series' history with title, units, frequency, latest value, window change, high / low |
+| `search_fred(text, limit=10)` | find a series id by keywords, sorted by FRED popularity |
+
+Every value is an observation with a date (one-day publication lag, business days only); the
+prompt tells the model to quote it as such and never as a live quote.
+
+Tests: `tests/test_fred.py` (fake session, no network).
+
 ## Live and intraday prices (Coin Metrics market data)
 
 Added 2026-09-16. The Coin Metrics key has full, undelayed access to the market-level

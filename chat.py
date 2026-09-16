@@ -71,7 +71,7 @@ def load_system_prompt(today: Optional[date] = None, path: Path = SYSTEM_PROMPT_
 def default_tools() -> list:
     """Market-data tools (tools/chat_tools.py) + live/intraday price tools (tools/intraday_tools.py)
     + Messari news / sector tools (tools/messari_tools.py) + CME futures / ETF on-chain tools
-    (tools/cme_tools.py) + desk BigQuery tools (tools/desk_tools.py)
+    (tools/cme_tools.py) + FRED macro tools (tools/macro_tools.py) + desk BigQuery tools (tools/desk_tools.py)
     + spot desk PnL sheet tools (tools/sheet_tools.py) + long-term memory tools
     (tools/memory_tools.py) + daily snapshot tools (tools/snapshot_tools.py, optional).
 
@@ -83,12 +83,13 @@ def default_tools() -> list:
     from tools.cme_tools import get_cme_tools
     from tools.desk_tools import get_desk_tools
     from tools.intraday_tools import get_intraday_tools
+    from tools.macro_tools import get_macro_tools
     from tools.memory_tools import get_memory_tools
     from tools.messari_tools import get_messari_tools
     from tools.sheet_tools import get_sheet_tools
 
-    tools = (get_chat_tools() + get_intraday_tools() + get_messari_tools() + get_cme_tools() + get_desk_tools()
-             + get_sheet_tools() + get_memory_tools())
+    tools = (get_chat_tools() + get_intraday_tools() + get_messari_tools() + get_cme_tools() + get_macro_tools()
+             + get_desk_tools() + get_sheet_tools() + get_memory_tools())
     try:
         from tools.snapshot_tools import get_snapshot_tools
     except ImportError:

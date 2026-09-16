@@ -155,6 +155,7 @@ def test_latest_changes_and_monthly_fallback(provider):
     un = df.set_index("series_id").loc["UNRATE"]
     assert un["value"] == 4.3 and str(un["date"])[:10] == M1.isoformat() and un["chg_1"] == pytest.approx(0.1)
     assert un["chg_1m"] == pytest.approx(0.1) and pd.isna(un["error"])                  # 400-day fallback for monthly data
+    assert un["chg_1w"] is None or pd.isna(un["chg_1w"])                                  # no one-week change for a monthly print
     bad = df.set_index("series_id").loc["NOPE"]
     assert pd.isna(bad["value"]) and "does not exist" in bad["error"]
     full = provider.latest()
@@ -183,7 +184,7 @@ def test_get_macro_snapshot_tool(provider):
     assert "**Rates**" in out and "**Labour**" in out and "**Equities**" not in out
     last_bd = SERIES["DGS10"][-1]["date"]
     assert f"| US 10y Treasury yield (DGS10) | 4.70% | {last_bd} | +1 bp | +5 bp | +20 bp |  |" in out
-    assert f"| Unemployment rate (monthly) (UNRATE) | 4.30% | {M1.isoformat()} | +10 bp | +10 bp | +10 bp |  |" in out
+    assert f"| Unemployment rate (monthly) (UNRATE) | 4.30% | {M1.isoformat()} | +10 bp | n/a | +10 bp |  |" in out
     assert "| US 30y Treasury yield (DGS30) | n/a | n/a | n/a | n/a | n/a | error: FRED HTTP 400" in out
     assert "quote the observation date" in out and "GICS" in out
     assert "Unknown group(s) bonds" in mac.get_macro_snapshot.invoke({"groups": "bonds"})

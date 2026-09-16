@@ -202,7 +202,10 @@ class FredProvider:
                 prev = df.iloc[-2]
                 rec["prev_value"], rec["prev_date"] = float(prev["value"]), prev["date"]
                 rec["chg_1"] = rec["value"] - rec["prev_value"]
+            monthly = len(df) > 1 and (last["date"] - df.iloc[-2]["date"]) > pd.Timedelta(days=20)
             for span, key in ((7, "1w"), (28, "1m")):
+                if key == "1w" and monthly:
+                    continue          # a monthly print has no one-week change; leave it n/a
                 older = df[df["date"] <= last["date"] - pd.Timedelta(days=span)]
                 if len(older):
                     v = float(older.iloc[-1]["value"])

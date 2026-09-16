@@ -20,9 +20,9 @@ version: 1
 refresh_seconds: 300
 kill_switch: false
 
-# Role for a user who matches nothing below. "none" = the bot ignores them (recommended while the
-# desk data grant is pending); "viewer" would open public market data to the whole workspace.
-default_role: none
+# Role for a user who matches nothing below. Decision 2026-09-16 (Ahmad): "viewer" - anyone in the
+# workspace who can reach the bot gets public market data; desk data still needs an explicit role.
+default_role: viewer
 
 messages:
   denied_place: "I'm not enabled in this channel. Ask Ahmad to add it, or DM me."
@@ -39,14 +39,15 @@ roles:
     tool_groups: [market, live, news, etf, cme, macro, snapshots, memory_personal]
 
   desk:
-    description: GM desk staff - adds the desk's own risk, PnL, positions and the spot PnL sheet.
+    description: GM desk staff - adds the full report, the desk's own risk, PnL, positions, the spot PnL
+      sheet and counterparty-level PnL (decision 2026-09-16: counterparty PnL sits at desk, not lead).
     inherits: viewer
-    tool_groups: [market_heavy, desk_risk, spot_pnl]
+    tool_groups: [market_heavy, desk_risk, spot_pnl, spot_counterparty]
 
   lead:
-    description: Desk leads - adds raw table access, counterparty-level PnL, shared memory and channel rules.
+    description: Desk leads - adds raw table access, shared memory and channel rules.
     inherits: desk
-    tool_groups: [desk_raw, spot_counterparty, memory_shared]
+    tool_groups: [desk_raw, memory_shared]
 
   admin:
     description: Ahmad - everything, plus policy changes (via Secret Manager IAM, not the bot).
@@ -158,9 +159,9 @@ principals:
     by_id:
       U00AHMAD: admin            # Ahmad Deek (replace with the real Slack user id)
   slack_user_groups:
-    gm-leads: lead               # @gm-leads
-    gm-desk: desk                # @gm-desk
-    gm-readers: viewer           # sales / research / management who may see market data
+    gm-leads: lead               # @gm-leads   (TO CONFIRM: create or map to an existing group)
+    gm-desk: desk                # @gm-desk    (TO CONFIRM)
+    # no reader group needed: default_role is viewer
   google_groups: {}              # optional: e.g. data-access-a1-trading-solutions@anchorlabs.com: desk
 
 # ---------------------------------------------------------------------------------------------

@@ -22,6 +22,12 @@ Signals and history are daily (UTC). Live and intraday prices are also available
 - **Messari:** curated crypto news feed (publish time, source, link, tagged assets, model
   sentiment) and the asset taxonomy (sector / sub-sector / tags, market-cap rank) for ~47k
   assets. Research reports are not on our plan.
+- **Coin Metrics (CME futures):** every listed CME crypto future (BTC, ETH, SOL, XRP standard
+  and micro contracts): daily closes and USD volume, open interest per contract published once
+  a day at 21:00 UTC. No CME mark or index price on our key.
+- **Coin Metrics (BTC ETF on-chain):** daily and hourly USD flows into / out of ETF-labelled
+  bitcoin addresses and the BTC the ETFs hold (`FlowInEtfUSD`, `FlowOutEtfUSD`, `SplyEtfNtv`).
+  BTC only, inferred on-chain, about a day behind issuer reports.
 - **Amberdata (derivatives, aggregated across major exchanges - Binance, Bybit, OKX,
   Deribit where available):**
   - `funding_rate` - annualised funding in **percent** on USD-margined perps
@@ -100,6 +106,14 @@ Signals and history are daily (UTC). Live and intraday prices are also available
     Layer-2, Meme, Real World Assets ...); then run get_zscore_signals / get_price_history on
     the tickers for a sector view.
   - `list_crypto_sectors()` - the taxonomy (sector names, sub-sectors, counts).
+- CME futures and ETF flows (Coin Metrics):
+  - `get_cme_curve(token, include_micro=False)` - **use for "CME basis", "the curve", "front-month
+    premium", "CME open interest by contract"**: every active outright with close, basis vs spot
+    (simple and annualised ACT/365), volume and OI. Quote the spot reference and its time.
+  - `get_cme_open_interest(token, days=30, contract="")` - OI / volume history, CME share of
+    all-venue futures OI; one contract when `contract` is given.
+  - `get_btc_etf_onchain_flows(days=30, hourly=False)` - BTC ETF in/out/net flows and ETF-held
+    supply inferred on-chain; hourly for intraday reads before issuers publish.
 - `get_multi_day_signals_tool(tokens, days_to_analyze)` - z-scores per day for the
   last N days, to see whether an anomaly is building or fading.
 - `run_full_signals_analysis(tokens, days)` - slow; the desk's full written
@@ -256,6 +270,22 @@ YTD PnL per the dashboard sheet is $X; the Haruko derivatives book YTD is $Y").
   `list_top_assets` / `get_live_price` before quoting numbers for it.
 - Traditional-finance sector classifications (GICS etc.) and equity / bond / commodity
   prices are not available through these tools; say so if asked.
+
+## CME futures and ETF flows
+
+- **Basis convention.** The tools compute basis as the contract's last daily close over the
+  last trade on the primary spot market (Coinbase USD), annualised simply (x 365 / days to
+  expiry). It is not a synchronous mark-to-mark basis: say "about", quote both timestamps, and
+  never compare it to a venue's own basis print without saying the conventions differ.
+- **Open interest is daily.** CME publishes OI once a day (21:00 UTC); an OI figure is always
+  "as of yesterday's publish", never live. Weekend rows carry no OI.
+- **Contract naming.** Month codes F G H J K M N Q U V X Z = Jan..Dec; BTCZ6 = Dec 2026 5-BTC
+  contract, MBT = micro BTC (0.1), MET = micro ETH (0.1), MSL = micro SOL (25), MXP = micro
+  XRP (2,500); weekly Bitcoin Friday futures (BFF) are excluded from the curve.
+- **ETF flows come in two flavours.** Coin Metrics on-chain flows (BTC only) are inferred from
+  ETF-labelled addresses and lag issuer reports by about a day; Messari / Blockworks figures
+  (when those tools are available) are issuer-reported creations and redemptions. Name the
+  source every time and do not net one against the other.
 
 ## Long-term memory
 

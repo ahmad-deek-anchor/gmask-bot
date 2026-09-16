@@ -236,6 +236,39 @@ covered by Messari; see the FRED section for the macro series we do have.
 
 Tests: `tests/test_messari.py` (fake session, no network).
 
+## CME crypto futures and BTC ETF on-chain flows (Coin Metrics)
+
+Added 2026-09-16. The Coin Metrics key already covers CME: `reference_data_markets(exchange="cme",
+type="future")` lists every contract (115 active on 2026-09-16 across BTC, ETH, SOL, XRP and
+CME's newer listings), daily / hourly candles carry USD volume, ticks are live, and per-contract
+open interest is published once a day at 21:00 UTC. There is no CME mark or index price on the
+key, and a contract that is listed but has never traded raises "market not supported" on the
+candle endpoint (the provider batches, then retries per market and drops it).
+
+Symbols: `<product><month code><year>` - BTCV6 = Oct 2026 5-BTC contract, MBTV6 = micro
+(0.1 BTC), ETHV6 (50 ETH) / METV6 (0.1 ETH), SOLV6 (500 SOL) / MSLV6 (25 SOL, booked under
+base `msl`), XRPV6 (50,000 XRP) / MXPV6 (2,500 XRP, base `mxp`); BFF<mdd> are the weekly
+Bitcoin Friday futures (0.02 BTC) and hyphenated symbols are calendar spreads.
+
+Provider (`providers/coinmetrics.py`): `cme_contracts(base, include_micro, include_weekly)`,
+`cme_curve(base, include_micro)` (last daily close, USD volume, OI in contracts / USD / coins,
+basis = close / spot last trade - 1, annualised x 365 / days, all against Coinbase spot and
+labelled as such), `cme_history(base, contract=None, days)` (OI / volume per day, summed over
+every active outright or for one contract, with Coin Metrics' all-venue futures OI for the CME
+share), `etf_onchain_flows("btc", days, frequency)` (`FlowInEtfUSD` / `FlowOutEtfUSD` at 1d or
+1h and `SplyEtfNtv` / `SplyEtfUSD` at 1d; BTC only - the metrics are inferred from ETF-labelled
+addresses and lag issuer reports by about a day).
+
+Tools (`tools/cme_tools.py`, registered after the Messari tools):
+
+| Tool | What it answers |
+|---|---|
+| `get_cme_curve(token, include_micro=False)` | the curve: per contract close, basis and annualised basis vs spot, volume, OI; total OI and curve shape |
+| `get_cme_open_interest(token, days=30, contract="")` | OI / volume history for all active outrights (with CME share of all-venue OI) or one contract |
+| `get_btc_etf_onchain_flows(days=30, hourly=False)` | BTC ETF in / out / net flows and ETF-held supply inferred on-chain, daily or hourly |
+
+Tests: `tests/test_cme.py` (fake client, no network).
+
 ## Live and intraday prices (Coin Metrics market data)
 
 Added 2026-09-16. The Coin Metrics key has full, undelayed access to the market-level

@@ -269,6 +269,9 @@ def test_default_tools_include_desk_tools():
     n_after_intra = n_chat + n_intra
     assert names[n_after_intra:n_after_intra + len(MESSARI_TOOL_NAMES)] == MESSARI_TOOL_NAMES
     n_after_intra += len(MESSARI_TOOL_NAMES)
+    from tools.cme_tools import CME_TOOL_NAMES
+    assert names[n_after_intra:n_after_intra + len(CME_TOOL_NAMES)] == CME_TOOL_NAMES
+    n_after_intra += len(CME_TOOL_NAMES)
     assert names[n_after_intra:n_after_intra + n_desk] == DESK_TOOL_NAMES
     assert names[n_after_intra + n_desk:n_after_intra + n_desk + n_sheet] == SHEET_TOOL_NAMES
     n_fixed = n_after_intra + n_desk + n_sheet
@@ -305,7 +308,8 @@ def test_system_prompt_today_injection():
                       "run_full_signals_analysis", "list_token_universe",
                       "get_desk_risk_snapshot", "get_perp_positions", "query_desk_data",
                       "remember", "recall", "forget", "what_do_you_remember", "set_channel_rule", "clear_channel_rule",
-                      "get_crypto_news", "classify_tokens", "get_sector_members", "list_crypto_sectors"):
+                      "get_crypto_news", "classify_tokens", "get_sector_members", "list_crypto_sectors",
+                      "get_cme_curve", "get_cme_open_interest", "get_btc_etf_onchain_flows"):
         assert tool_name in prompt
     assert "## News and classification (Messari)" in prompt
     assert "Desk data (BigQuery)" in prompt and "data_quality_flag" in prompt and "brokerage_a1" in prompt

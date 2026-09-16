@@ -1,6 +1,8 @@
 # Deploying the Slack bot to Cloud Run
 
-Nothing in this document has been executed yet. It is the plan for running
+**Deployed 2026-09-14** as Cloud Run service `trading-signals-slack` (project `anchorage-corp-eng-playground`, region `us-east1`, revision 00001, service account `gm-bot@anchorage-corp-eng-playground.iam.gserviceaccount.com`, entrypoint `python cloudrun_entry.py -v`). `cloudrun_entry.py` adds the `$PORT` health listener that Cloud Run's startup probe requires and then runs the unchanged `slack_bot.run_bot()`. `gm-bot` was granted `secretmanager.secretAccessor` on the three `trading_signals_slack_*` secrets the same day. Still open: `roles/bigquery.dataViewer` on `anc-global-markets:brokerage_a1` / `pricing` for `gm-bot` (desk tools answer "not available" until granted) and A1 Metrics Dashboard sheet access (domain policy blocks sharing with a service account). The text below is the plan that was followed.
+
+Originally: nothing in this document had been executed yet. It is the plan for running
 `slack_bot.py` as a single always-on Cloud Run instance, plus a local systemd
 alternative and the daily-post timer.
 

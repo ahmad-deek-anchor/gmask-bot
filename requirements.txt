@@ -9,6 +9,7 @@ anthropic>=0.35,<1.0
 # Slack bot (Bolt Socket Mode) + SQLite conversation memory
 slack_bolt>=1.20
 slack_sdk>=3.30
+aiohttp>=3.9        # Socket Mode WebSocket client + Cloud Run health endpoint (cloudrun_entry.py)
 aiosqlite>=0.20
 langgraph-checkpoint-sqlite>=2.0
 

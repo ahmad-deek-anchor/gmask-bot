@@ -230,6 +230,33 @@ def _asset_record(a: dict) -> dict:
 ASSET_COLUMNS = ["slug", "symbol", "name", "rank", "sector", "sub_sector", "tags", "category", "has_news", "has_intel"]
 
 
+_CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
+_ETF_RENAMES = (
+    ("type_spot_unitedstates_", "us_spot_"), ("type_spot_europe_", "europe_spot_"), ("type_spot_apac_", "apac_spot_"),
+    ("type_spot_", "spot_"), ("type_futures_", "futures_"), ("strategy_deltaone_", "deltaone_"),
+    ("strategy_leveraged_", "leveraged_"), ("volume_unitedstates_usd", "us_volume_usd"),
+    ("volume_europe_usd", "europe_volume_usd"), ("volume_apac_usd", "apac_volume_usd"), ("_product_count", "_products"),
+)
+
+
+def metric_name(raw: str) -> str:
+    """Messari metric key (camelCase or kebab-case) -> snake_case with the ETF prefixes shortened:
+    'typeSpotUnitedstatesFlowUsd' / 'type-spot-unitedstates-flow-usd' -> 'us_spot_flow_usd'."""
+    s = _CAMEL_RE.sub("_", str(raw)).replace("-", "_").lower()
+    for a, b in _ETF_RENAMES:
+        s = s.replace(a, b)
+    return s
+
+
+def _epoch(v):
+    """Messari 'asOf' / point timestamps are epoch seconds (sometimes ms); return a UTC Timestamp or NaT."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return pd.NaT
+    return pd.to_datetime(v, unit="ms" if v > 1e11 else "s", utc=True)
+
+
 def _qualifier(cm_asset_id: Optional[str]) -> Optional[str]:
     """'tao_bittensor' -> 'bittensor'; 'btc' -> None."""
     if cm_asset_id and "_" in cm_asset_id:
@@ -565,7 +592,186 @@ class MessariProvider:
         return df
 
 
+    # ------------------------------------------------------------------ ETFs (Blockworks via Messari)
+
+    @staticmethod
+    def _latest_table(data) -> pd.DataFrame:
+        rows = []
+        for r in data or []:
+            if not isinstance(r, dict):
+                continue
+            rec = {"id": r.get("id") or r.get("slug") or "", "slug": r.get("slug") or "", "name": r.get("name") or "",
+                   "as_of": _epoch(r.get("asOf"))}
+            for k, v in (r.get("metrics") or {}).items():
+                rec[metric_name(k)] = pd.to_numeric(v, errors="coerce") if v is not None else pd.NA
+            rows.append(rec)
+        return pd.DataFrame(rows)
+
+    @_ttl_memoised(TTL_ETF_S)
+    def etf_assets(self) -> Optional[pd.DataFrame]:
+        """Latest crypto ETF figures per underlying asset (bitcoin, ethereum, solana, xrp, multi-asset ...).
+
+        Columns: id, slug, name, as_of (UTC) and the Blockworks metrics in snake_case:
+        spot_aum_usd, spot_flow_usd, spot_products, futures_aum_usd, futures_flow_usd,
+        futures_products, us_spot_aum_usd / europe_spot_ / apac_spot_ (aum, flow, products),
+        deltaone_* and leveraged_* (aum, flow, products), total_volume_usd, us_volume_usd ...
+        A null flow means "not yet published for that day", never zero. None on failure."""
+        data, _ = self.http.page(ETF_ASSETS)
+        if data is None:
+            return None
+        return self._latest_table(data)
+
+    @_ttl_memoised(TTL_ETF_S)
+    def etf_providers(self, n: int = 25) -> Optional[pd.DataFrame]:
+        """Latest figures per ETF issuer, largest AUM first: id (Blockworks slug), name, as_of,
+        aum_usd, flow_usd, num_products, weighted_aum_expense_ratio, bitcoin_aum_perc,
+        spot_aum_perc, rolling_30d_flow_usd, aum_30d_change_perc. None on failure."""
+        data, _ = self.http.page(ETF_PROVIDERS, {"limit": max(1, min(int(n), 100)), "page": 1, "sort": "aum-usd", "order": "desc"})
+        if data is None:
+            return None
+        df = self._latest_table(data)
+        if "aum_usd" in df.columns:
+            df = df.sort_values("aum_usd", ascending=False).reset_index(drop=True)
+        return df
+
+    def _timeseries(self, path: str, days: int) -> Optional[pd.DataFrame]:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=max(1, min(int(days), 3650)))
+        data, meta = self.http.page(path, {"start": _utc_iso(start), "end": _utc_iso(end)})
+        if data is None:
+            return None
+        points = (data.get("points") if isinstance(data, dict) else None) or []
+        schema = [metric_name(c.get("slug")) for c in (meta.get("pointSchemas") or []) if isinstance(c, dict)]
+        if not schema and points:
+            schema = ["time"] + [f"m{i}" for i in range(1, len(points[0]))]
+        rows = [dict(zip(schema, pt)) for pt in points if isinstance(pt, (list, tuple))]
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        df["time"] = df["time"].map(_epoch)
+        for c in df.columns:
+            if c != "time":
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.sort_values("time").reset_index(drop=True)
+
+    @_ttl_memoised(TTL_ETF_S)
+    def etf_asset_timeseries(self, asset: str = "bitcoin", days: int = 30) -> Optional[pd.DataFrame]:
+        """Daily ETF history for one underlying (identifier 'bitcoin', 'ethereum', 'solana', 'xrp'):
+        time plus the same snake_case metric columns as ``etf_assets``. Null flows on the latest
+        day mean not yet published. None on failure, empty frame when Messari has no rows."""
+        return self._timeseries(ETF_ASSET_TIMESERIES.format(asset=(asset or "bitcoin").strip().lower()), days)
+
+    @_ttl_memoised(TTL_ETF_S)
+    def etf_provider_timeseries(self, provider: str, days: int = 30) -> Optional[pd.DataFrame]:
+        """Daily history for one issuer (Blockworks slug such as 'blackrock', 'fidelity', 'grayscale')."""
+        return self._timeseries(ETF_PROVIDER_TIMESERIES.format(provider=(provider or "").strip().lower()), days)
+
+    # ------------------------------------------------------------------ Intel events
+
+    @_ttl_memoised(TTL_INTEL_S)
+    def intel_events(self, assets: Sequence[str], days: int = 30, importance: Optional[Sequence[str]] = None,
+                     limit: int = 50, cm_ids: Optional[dict] = None) -> Optional[pd.DataFrame]:
+        """Messari Intel events (upgrades, governance, listings, legal, hacks ...) that name any of
+        ``assets`` as primary or secondary, newest first.
+
+        Columns: date (UTC), name, importance (High / Medium / Low), status (Proposed, Discussed,
+        Planned, In-Progress, Completed, Rejected), category, subcategory, assets (primary
+        symbols), secondary (symbols), details (markdown), link (first resource), id.
+        ``attrs``: slugs, unknown, since. None on failure."""
+        slugs, unknown = [], []
+        for a in list(assets or [])[:NEWS_MAX_ASSETS]:
+            rec = self.asset_record(a, (cm_ids or {}).get(str(a).lower()))
+            (slugs.append(rec["slug"]) if rec else unknown.append(str(a)))
+        cols = ["date", "name", "importance", "status", "category", "subcategory", "assets", "secondary", "details", "link", "id"]
+        since = datetime.now(timezone.utc) - timedelta(days=max(1, min(int(days), 3650)))
+        if not slugs:
+            df = pd.DataFrame(columns=cols)
+            df.attrs.update({"slugs": [], "unknown": unknown, "since": since})
+            return df
+        params = {"primaryOrSecondaryAssets": ",".join(slugs), "startTime": _utc_iso(since),
+                  "limit": max(1, min(int(limit), 100)), "page": 1}
+        if importance:
+            params["importance"] = ",".join(str(i).capitalize() for i in importance)
+        data, _ = self.http.page(INTEL_EVENTS, params)
+        if data is None:
+            return None
+        rows = []
+        for e in data:
+            if not isinstance(e, dict):
+                continue
+            res = [r for r in (e.get("resources") or []) if isinstance(r, dict) and r.get("link")]
+            rows.append({
+                "date": pd.to_datetime(e.get("eventDate") or e.get("submissionDate"), utc=True, errors="coerce"),
+                "name": e.get("eventName") or "", "importance": e.get("importance") or "", "status": e.get("status") or "",
+                "category": e.get("category") or "", "subcategory": e.get("subcategory") or "",
+                "assets": [a.get("symbol") or a.get("slug") for a in (e.get("primaryAssets") or []) if isinstance(a, dict)],
+                "secondary": [a.get("symbol") or a.get("slug") for a in (e.get("secondaryAssets") or []) if isinstance(a, dict)],
+                "details": e.get("eventDetails") or "", "link": res[0]["link"] if res else "", "id": e.get("id") or "",
+            })
+        df = pd.DataFrame(rows, columns=cols)
+        if len(df):
+            df = df.sort_values("date", ascending=False).reset_index(drop=True)
+        df.attrs.update({"slugs": slugs, "unknown": unknown, "since": since})
+        return df
+
+    # ------------------------------------------------------------------ social signals (mindshare)
+
+    @_ttl_memoised(TTL_SIGNALS_S)
+    def signals(self, assets: Sequence[str], cm_ids: Optional[dict] = None) -> Optional[pd.DataFrame]:
+        """Messari Signals for up to 10 assets: mindshare (share of tracked influencer attention, %)
+        over 24h / 7d / 30d with its change, the 24h sentiment close and 7d mean (-1..1), post and
+        author counts, and Messari's generated 24h / 7d insight text.
+
+        Columns: symbol, slug, name, mindshare_24h, mindshare_24h_chg, mindshare_7d, mindshare_7d_chg,
+        mindshare_30d, mindshare_30d_chg, sentiment_24h, sentiment_7d, posts_24h, authors_24h,
+        posts_7d, insight_24h, insight_7d. ``attrs``: unknown. None on failure."""
+        slugs, unknown = [], []
+        for a in list(assets or [])[:10]:
+            rec = self.asset_record(a, (cm_ids or {}).get(str(a).lower()))
+            (slugs.append(rec["slug"]) if rec else unknown.append(str(a)))
+        cols = ["symbol", "slug", "name", "mindshare_24h", "mindshare_24h_chg", "mindshare_7d", "mindshare_7d_chg",
+                "mindshare_30d", "mindshare_30d_chg", "sentiment_24h", "sentiment_7d", "posts_24h", "authors_24h",
+                "posts_7d", "insight_24h", "insight_7d"]
+        if not slugs:
+            df = pd.DataFrame(columns=cols)
+            df.attrs["unknown"] = unknown
+            return df
+        data, _ = self.http.page(SIGNALS_ASSETS, {"assetIds": ",".join(slugs), "limit": len(slugs), "page": 1})
+        if data is None:
+            return None
+
+        def g(d, *path):
+            for k in path:
+                d = d.get(k) if isinstance(d, dict) else None
+            return d
+
+        rows = []
+        for r in data:
+            if not isinstance(r, dict):
+                continue
+            ms, se, pm = r.get("mindshare") or {}, r.get("sentiment") or {}, r.get("postMetrics") or {}
+            rows.append({
+                "symbol": (r.get("symbol") or "").upper(), "slug": r.get("slug") or "", "name": r.get("name") or "",
+                "mindshare_24h": g(ms, "24h", "percentage"), "mindshare_24h_chg": g(ms, "24h", "percentageChange"),
+                "mindshare_7d": g(ms, "7d", "percentage"), "mindshare_7d_chg": g(ms, "7d", "percentageChange"),
+                "mindshare_30d": g(ms, "30d", "percentage"), "mindshare_30d_chg": g(ms, "30d", "percentageChange"),
+                "sentiment_24h": g(se, "24h", "close"), "sentiment_7d": g(se, "7d", "mean"),
+                "posts_24h": g(pm, "24h", "totalPosts"), "authors_24h": g(pm, "24h", "uniqueAuthorsMentioning"),
+                "posts_7d": g(pm, "7d", "totalPosts"),
+                "insight_24h": g(ms, "24h", "insight", "message") or "", "insight_7d": g(ms, "7d", "insight", "message") or "",
+            })
+        df = pd.DataFrame(rows, columns=cols)
+        for c in cols[3:14]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        # keep the caller's order
+        order = {s: i for i, s in enumerate(slugs)}
+        df = df.assign(_o=df["slug"].map(order)).sort_values("_o").drop(columns="_o").reset_index(drop=True)
+        df.attrs["unknown"] = unknown
+        return df
+
+
 __all__ = [
     "ASSET_COLUMNS", "BASE_URL", "MessariHTTP", "MessariProvider", "NEWS_MAX_ASSETS", "NEWS_SOURCE_TYPES",
-    "RETRY_STATUSES", "SYMBOL_TO_SLUG", "TTL_ASSETS_S", "TTL_NEWS_S",
+    "RETRY_STATUSES", "SYMBOL_TO_SLUG", "TTL_ASSETS_S", "TTL_ETF_S", "TTL_INTEL_S", "TTL_NEWS_S", "TTL_SIGNALS_S",
+    "metric_name",
 ]

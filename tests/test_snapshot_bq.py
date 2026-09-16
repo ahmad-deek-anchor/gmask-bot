@@ -455,7 +455,7 @@ def test_deploy_script_and_timer_units():
     text = script.read_text()
     assert script.stat().st_mode & 0o111, "deploy script must be executable"
     assert "gcloud run jobs deploy" in text and "trading-signals-snapshot" in text
-    assert "snapshot_daily.py,--sources,${SOURCES}" in text and 'SOURCES="${SOURCES:-signals}"' in text
+    assert "snapshot_daily.py,--sources,${SOURCES}" in text and 'SOURCES="${SOURCES:-signals,etf,cme}"' in text
     assert "SNAPSHOT_BACKEND=bigquery" in text and "gm-bot@" in text
     assert "30 23 * * *" in text and "jobs/${JOB}:run" in text
     unit = (ROOT / "deploy" / "trading-signals-snapshot.service").read_text()

@@ -27,11 +27,23 @@ Sources (each isolated: one failing never stops the others):
     sheet    providers.gsheets A1 Metrics Dashboard: per entity HOLD / A1 / TOTAL
              the current month (mtd_*) and YTD (ytd_*) volume, PnL and take rate,
              plus the latest weekly PnL row (week_*).
+    etf      Messari / Blockworks crypto ETF table (providers.messari.etf_assets):
+             per underlying (entity "bitcoin", "ethereum", "solana", "xrp", "multi-asset")
+             spot / futures AUM, latest published flow, product counts, regional AUM
+             and flow, volume; null flows are skipped (not yet published, never 0).
+             Plus entity "bitcoin" Coin Metrics on-chain ETF metrics onchain_flow_in_usd,
+             onchain_flow_out_usd, onchain_net_flow_usd, etf_supply_btc, etf_supply_usd.
+    cme      Coin Metrics CME futures (providers.coinmetrics.cme_curve) for btc, eth,
+             sol, xrp: per contract (entity = symbol, e.g. "BTCZ6") close, oi_contracts,
+             oi_usd, volume_usd, basis_ann_pct, days_to_expiry; per underlying (entity
+             = "btc") cme_oi_usd, cme_volume_usd, front_basis_ann_pct, next_basis_ann_pct,
+             spot_ref (value_json names the front contract and the spot market).
 
 Examples
 --------
     python snapshot_daily.py                         # all sources, today's UTC date
     python snapshot_daily.py --sources haruko,sheet  # subset
+    python snapshot_daily.py --sources etf,cme       # vendor tables (Cloud Run job runs signals,etf,cme)
     python snapshot_daily.py --date 2026-09-10       # store under another date
     python snapshot_daily.py --dry-run -v            # print rows, write nothing
 
@@ -53,8 +65,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 logger = logging.getLogger("snapshot_daily")
 
-SOURCES = ("haruko", "signals", "sheet")
+SOURCES = ("haruko", "signals", "sheet", "etf", "cme")
 SIGNALS_DAYS = 45
+CME_SNAPSHOT_BASES = ("btc", "eth", "sol", "xrp")
+ETF_ASSET_METRICS = ("spot_aum_usd", "spot_flow_usd", "spot_products", "futures_aum_usd", "futures_flow_usd",
+                     "futures_products", "us_spot_aum_usd", "us_spot_flow_usd", "us_spot_products",
+                     "europe_spot_aum_usd", "europe_spot_flow_usd", "apac_spot_aum_usd", "apac_spot_flow_usd",
+                     "deltaone_aum_usd", "leveraged_aum_usd", "total_volume_usd")
 
 # ---------------------------------------------------------------------------
 # haruko (BigQuery) column mapping
@@ -398,6 +415,142 @@ def capture_sheet(sheet=None, today: Optional[date] = None) -> SourceResult:
 
 
 # ---------------------------------------------------------------------------
+# source: etf (Messari / Blockworks + Coin Metrics on-chain)
+# ---------------------------------------------------------------------------
+
+def _get_messari():
+    from providers.factory import get_messari_provider
+    return get_messari_provider()
+
+
+def _get_spot():
+    """The Coin Metrics provider (composite .spot)."""
+    from providers.factory import get_provider
+    provider = get_provider()
+    return getattr(provider, "spot", provider)
+
+
+def capture_etf(messari=None, spot=None) -> SourceResult:
+    import pandas as pd
+
+    res = SourceResult("etf")
+    messari = messari if messari is not None else _get_messari()
+    errors: List[str] = []
+
+    # --- Messari / Blockworks per-asset table ---------------------------------
+    if messari is None:
+        errors.append("messari: provider unavailable (no API key)")
+    else:
+        try:
+            df = messari.etf_assets()
+            res.calls["messari_requests"] = res.calls.get("messari_requests", 0) + 1
+            if df is None:
+                errors.append("messari: etf_assets returned nothing")
+            else:
+                for _, r in df.iterrows():
+                    ent = str(r.get("id") or r.get("slug") or "").strip().lower()
+                    if not ent:
+                        continue
+                    as_of = r.get("as_of")
+                    vj = _dumps({"as_of": _iso(as_of) if not pd.isna(as_of) else None, "vendor": "Messari / Blockworks Research",
+                                 "note": "flows missing when not yet published"})
+                    for metric in ETF_ASSET_METRICS:
+                        v = _num(r.get(metric)) if metric in df.columns else None
+                        if v is not None:
+                            res.rows.append(Row(ent, metric, v, vj))
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"messari: {type(e).__name__}: {e}")
+
+    # --- Coin Metrics on-chain BTC ETF metrics ---------------------------------
+    try:
+        spot = spot if spot is not None else _get_spot()
+        oc = spot.etf_onchain_flows("btc", days=4)
+        res.calls["coinmetrics_requests"] = res.calls.get("coinmetrics_requests", 0) + 2
+        if oc is None or oc.empty:
+            errors.append("coinmetrics: no on-chain ETF rows")
+        else:
+            last = oc.iloc[-1]
+            vj = _dumps({"as_of": _iso(last["time"]), "vendor": "Coin Metrics on-chain (ETF-labelled addresses)"})
+            for metric, col in (("onchain_flow_in_usd", "flow_in_usd"), ("onchain_flow_out_usd", "flow_out_usd"),
+                                ("onchain_net_flow_usd", "net_flow_usd")):
+                v = _num(last.get(col))
+                if v is not None:
+                    res.rows.append(Row("bitcoin", metric, v, vj))
+            sup = oc.dropna(subset=["supply_btc"])
+            if len(sup):
+                s_last = sup.iloc[-1]
+                sj = _dumps({"as_of": _iso(s_last["time"]), "vendor": "Coin Metrics on-chain (ETF-labelled addresses)"})
+                for metric, col in (("etf_supply_btc", "supply_btc"), ("etf_supply_usd", "supply_usd")):
+                    v = _num(s_last.get(col))
+                    if v is not None:
+                        res.rows.append(Row("bitcoin", metric, v, sj))
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"coinmetrics: {type(e).__name__}: {e}")
+
+    if errors and not res.rows:
+        raise RuntimeError("; ".join(errors))
+    if errors:
+        logger.warning("etf: partial capture (%s)", "; ".join(errors))
+    return res
+
+
+# ---------------------------------------------------------------------------
+# source: cme (Coin Metrics CME futures)
+# ---------------------------------------------------------------------------
+
+def capture_cme(spot=None, bases: Sequence[str] = CME_SNAPSHOT_BASES) -> SourceResult:
+    import pandas as pd
+
+    res = SourceResult("cme")
+    spot = spot if spot is not None else _get_spot()
+    errors: List[str] = []
+    for base in bases:
+        res.calls["curve_calls"] = res.calls.get("curve_calls", 0) + 1
+        try:
+            curve = spot.cme_curve(base, include_micro=True)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{base}: {type(e).__name__}: {e}")
+            continue
+        if curve is None or curve.empty:
+            errors.append(f"{base}: no contracts with data")
+            continue
+        spot_ref = curve.attrs.get("spot")
+        common = {"base": base, "spot_ref": spot_ref, "spot_market": curve.attrs.get("spot_market"),
+                  "spot_time": _iso(curve.attrs.get("spot_time")) if curve.attrs.get("spot_time") is not None else None,
+                  "basis": "close / spot last trade - 1, annualised x 365 / days (ACT/365)"}
+        for _, r in curve.iterrows():
+            cj = _dumps({**common, "as_of": _iso(r.get("close_time")) if not pd.isna(r.get("close_time")) else None,
+                         "oi_as_of": _iso(r.get("oi_time")) if not pd.isna(r.get("oi_time")) else None,
+                         "expiration": _iso(r.get("expiration")), "product": r.get("product"),
+                         "contract_size": _num(r.get("contract_size")), "is_standard": bool(r.get("is_standard"))})
+            for metric, col in (("close", "close"), ("oi_contracts", "oi_contracts"), ("oi_usd", "oi_usd"),
+                                ("volume_usd", "usd_volume"), ("basis_ann_pct", "basis_ann_pct"),
+                                ("days_to_expiry", "days_to_expiry")):
+                v = _num(r.get(col))
+                if v is not None:
+                    res.rows.append(Row(str(r["symbol"]), metric, v, cj))
+        std = curve[curve["is_standard"]]
+        front = std.iloc[0] if len(std) else None
+        nxt = std.iloc[1] if len(std) > 1 else None
+        aj = _dumps({**common, "as_of": _iso(curve.attrs.get("oi_as_of")) if curve.attrs.get("oi_as_of") is not None else None,
+                     "front_contract": None if front is None else str(front["symbol"]),
+                     "next_contract": None if nxt is None else str(nxt["symbol"]),
+                     "contracts": [str(x) for x in curve["symbol"].tolist()]})
+        for metric, v in (("cme_oi_usd", _num(curve["oi_usd"].sum(min_count=1))),
+                          ("cme_volume_usd", _num(curve["usd_volume"].sum(min_count=1))),
+                          ("front_basis_ann_pct", None if front is None else _num(front.get("basis_ann_pct"))),
+                          ("next_basis_ann_pct", None if nxt is None else _num(nxt.get("basis_ann_pct"))),
+                          ("spot_ref", _num(spot_ref))):
+            if v is not None:
+                res.rows.append(Row(base, metric, v, aj))
+    if errors and not res.rows:
+        raise RuntimeError("; ".join(errors))
+    if errors:
+        logger.warning("cme: partial capture (%s)", "; ".join(errors))
+    return res
+
+
+# ---------------------------------------------------------------------------
 # orchestration
 # ---------------------------------------------------------------------------
 
@@ -405,6 +558,8 @@ CAPTURES: Dict[str, Callable[[], SourceResult]] = {
     "haruko": capture_haruko,
     "signals": capture_signals,
     "sheet": capture_sheet,
+    "etf": capture_etf,
+    "cme": capture_cme,
 }
 
 

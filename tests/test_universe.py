@@ -170,3 +170,41 @@ def test_list_top_assets_tool(monkeypatch):
     assert "| 1 | btc |" in out and "| 3 | tao |" in out and "usdt" not in out
     out_all = chat_tools.list_top_assets.invoke({"n": 3, "include_stables_and_wrapped": True})
     assert "usdt" in out_all
+
+
+def test_top_assets_left_joins_a_sector_classifier(universe):
+    seen = {}
+
+    def classifier(symbols, cm_ids):
+        seen["symbols"], seen["cm_ids"] = list(symbols), dict(cm_ids)
+        return pd.DataFrame({"symbol": ["btc", "tao"], "sector": [["Networks"], ["AI", "DePIN"]],
+                             "sub_sector": [["Layer-1"], ["AI Compute"]], "slug": ["bitcoin", "bittensor-0"]})
+
+    top = universe.top_assets(n=4, classifier=classifier)
+    assert seen["symbols"] == ["btc", "eth", "tao", "sky"] and seen["cm_ids"]["tao"] == "tao_bittensor"
+    assert list(top.columns) == ["rank", "asset", "symbol", "market_cap", "spot_volume", "as_of", "sector", "sub_sector"]
+    assert top.set_index("symbol").loc["tao", "sector"] == ["AI", "DePIN"]
+    assert top.set_index("symbol").loc["eth", "sector"] is None or pd.isna(top.set_index("symbol").loc["eth", "sector"])
+    assert "slug" not in top.columns
+    # a failing classifier never breaks the ranking
+    plain = universe.top_assets(n=2, classifier=lambda s, c: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert list(plain.columns) == ["rank", "asset", "symbol", "market_cap", "spot_volume", "as_of"]
+
+
+def test_list_top_assets_tool_shows_sectors_when_messari_is_up(monkeypatch):
+    from providers import factory
+    from tools import chat_tools
+    prov = CoinMetricsProvider(FakeClient())
+    monkeypatch.setattr(factory, "get_provider", lambda: prov)
+
+    class Messari:
+        def classify(self, symbols, cm_ids=None):
+            return pd.DataFrame({"symbol": symbols, "slug": symbols, "name": symbols, "rank": 1,
+                                 "sector": [["Networks"]] * len(symbols), "sub_sector": [["Layer-1"]] * len(symbols), "tags": [[]] * len(symbols)})
+    monkeypatch.setattr(chat_tools, "_sector_classifier", lambda: (lambda s, c: Messari().classify(s, c)))
+    out = chat_tools.list_top_assets.invoke({"n": 2})
+    assert "| # | ticker | market cap | 24h spot volume | curated | sector | sub-sector |" in out
+    assert "| 1 | btc |" in out and "| Networks | Layer-1 |" in out and "Messari's taxonomy" in out
+    monkeypatch.setattr(chat_tools, "_sector_classifier", lambda: None)
+    out = chat_tools.list_top_assets.invoke({"n": 2})
+    assert "sector" not in out.split("\n")[1]

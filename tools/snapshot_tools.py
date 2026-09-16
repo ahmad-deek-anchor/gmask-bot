@@ -17,6 +17,16 @@ Sources / entities / metrics (see snapshot_daily.py for the full list):
   Metrics mtd_volume_usd, mtd_pnl_usd, mtd_take_rate_bps, ytd_volume_usd, ytd_pnl_usd,
   ytd_take_rate_bps, ytd_target_pnl_usd, ytd_pct_of_target (TOTAL only), week_pnl_usd,
   week_realized_pnl_usd / week_unrealized_pnl_usd (A1 only).
+* ``etf`` - crypto ETFs (Messari / Blockworks). Entities ``bitcoin`` (default), ``ethereum``,
+  ``solana``, ``xrp``, ``multi-asset``. Metrics spot_aum_usd, spot_flow_usd, spot_products,
+  futures_aum_usd, futures_flow_usd, us_/europe_/apac_spot_aum_usd and _flow_usd,
+  deltaone_aum_usd, leveraged_aum_usd, total_volume_usd; ``bitcoin`` also carries the Coin
+  Metrics on-chain onchain_flow_in_usd / onchain_flow_out_usd / onchain_net_flow_usd,
+  etf_supply_btc, etf_supply_usd.
+* ``cme`` - CME crypto futures (Coin Metrics). Entities ``btc`` (default), ``eth``, ``sol``,
+  ``xrp`` (cme_oi_usd, cme_volume_usd, front_basis_ann_pct, next_basis_ann_pct, spot_ref) and
+  each contract symbol (``BTCZ6``: close, oi_contracts, oi_usd, volume_usd, basis_ann_pct,
+  days_to_expiry).
 
 Every tool returns compact markdown and states the snapshot dates it used. Snapshots
 are taken once a day (23:30 UTC timer); the ``signals`` values are as of the last
@@ -36,8 +46,8 @@ from tools.desk_tools import _md_table, _usd
 
 logger = logging.getLogger(__name__)
 
-SOURCES = ("haruko", "signals", "sheet")
-DEFAULT_ENTITY = {"haruko": "combined", "signals": None, "sheet": "TOTAL"}
+SOURCES = ("haruko", "signals", "sheet", "etf", "cme")
+DEFAULT_ENTITY = {"haruko": "combined", "signals": None, "sheet": "TOTAL", "etf": "bitcoin", "cme": "btc"}
 HARUKO_ALIASES = {
     "combined": "combined", "all": "combined", "desk": "combined", "total": "combined",
     "20": "20", "a1": "20", "a1 ltd": "20", "a1ltd": "20", "a1_ltd": "20",
@@ -52,7 +62,8 @@ UNAVAILABLE = ("Snapshot store is not available (providers.memory_store / MEMORY
                "Run `python snapshot_daily.py` to start collecting daily snapshots.")
 
 _USD_HINTS = ("usd", "pnl", "notional", "equity", "delta", "gamma", "vega", "theta",
-              "volume", "price", "liquidations", "oi", "target")
+              "volume", "price", "liquidations", "oi", "target", "aum", "flow", "close", "spot_ref")
+_COUNT_METRICS = ("oi_contracts", "spot_products", "futures_products", "us_spot_products", "etf_supply_btc", "days_to_expiry")
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +184,8 @@ def _entity(source: str, entity: Optional[str]) -> Optional[str]:
         return HARUKO_ALIASES.get(e.lower(), e)
     if source == "sheet":
         return e.upper()
+    if source == "cme":
+        return e.upper() if len(e) > 4 else e.lower()      # contract symbols (BTCZ6) vs underlyings (btc)
     return e.lower()
 
 
@@ -200,6 +213,8 @@ def _fmt(metric: str, v: Optional[float], vj: Optional[dict] = None) -> str:
     if v is None:
         return "n/a"
     m = metric.lower()
+    if m in _COUNT_METRICS:
+        return f"{v:,.0f}"
     if m.endswith("_z"):
         return f"{v:+.2f}"
     if m.endswith("_bps"):
@@ -251,10 +266,12 @@ def get_snapshot_history(source: str, metric: str, entity: Optional[str] = None,
     as the collection history.
 
     Args:
-        source: 'haruko' | 'signals' | 'sheet'.
+        source: 'haruko' | 'signals' | 'sheet' | 'etf' | 'cme'.
         metric: Snapshot metric name (see list_snapshot_metrics).
         entity: haruko: 'combined' (default), '20' / 'a1' (A1 Ltd), '86' / 'adsd';
-            signals: the token, e.g. 'btc' (required); sheet: 'TOTAL' (default), 'HOLD', 'A1'.
+            signals: the token, e.g. 'btc' (required); sheet: 'TOTAL' (default), 'HOLD', 'A1';
+            etf: 'bitcoin' (default), 'ethereum', 'solana', 'xrp', 'multi-asset';
+            cme: 'btc' (default) / 'eth' / 'sol' / 'xrp' for the aggregate, or a contract symbol like 'BTCZ6'.
         days: Look-back window in days (default 30, max 3650).
     """
     src = _source(source)
@@ -354,7 +371,7 @@ def list_snapshot_metrics(source: str = "") -> str:
     """List which snapshot metrics (and entities / tokens) have been captured for a source, and the latest snapshot date. Call this before get_snapshot_history / compare_to_snapshot when unsure of a metric name.
 
     Args:
-        source: 'haruko' | 'signals' | 'sheet'; empty for all three.
+        source: 'haruko' | 'signals' | 'sheet' | 'etf' | 'cme'; empty for all of them.
     """
     srcs = [_source(source)] if source else list(SOURCES)
     if srcs == [None]:
@@ -369,10 +386,10 @@ def list_snapshot_metrics(source: str = "") -> str:
             if not by_entity:
                 out.append("- no snapshots captured yet (run `python snapshot_daily.py`)")
                 continue
-            if src == "signals" and len(by_entity) > 1:
+            if src in ("signals", "cme") and len(by_entity) > 1:
                 tokens = sorted(e for e in by_entity if e != "*")
                 metrics = sorted({m for ms in by_entity.values() for m in ms})
-                out.append(f"- tokens ({len(tokens)}): {', '.join(tokens)}")
+                out.append(f"- {'entities' if src == 'cme' else 'tokens'} ({len(tokens)}): {', '.join(tokens)}")
                 out.append(f"- metrics ({len(metrics)}): {', '.join(metrics)}")
             else:
                 for ent, ms in by_entity.items():

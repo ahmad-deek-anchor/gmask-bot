@@ -230,6 +230,20 @@ Tools (`tools/messari_tools.py`, registered after the intraday tools):
 | `classify_tokens(tokens)` | Messari sector / sub-sector / tags and rank per ticker |
 | `get_sector_members(sector, n=25)` | constituents of a sector, sub-sector or tag ("DePIN", "Layer-2", "Proof-of-Work") by rank |
 | `list_crypto_sectors()` | the taxonomy: sectors, sub-sectors, counts, largest tickers |
+| `get_etf_overview(asset="bitcoin")` | crypto ETF AUM / latest flow / product counts per underlying (bitcoin, ethereum, solana, xrp, multi-asset), regional split, top issuers (Blockworks data) |
+| `get_etf_flows(asset="bitcoin", days=30)` | daily issuer-reported spot / futures ETF flows, AUM and regional flows; bitcoin rows also show the Coin Metrics on-chain net flow |
+| `get_intel_events(tokens, days=30, importance="")` | Messari Intel events (upgrades, governance, listings, legal, hacks) with importance / status / link |
+| `get_social_signals(tokens)` | mindshare (share of tracked influencer attention), sentiment, post counts, Messari's generated insight |
+
+ETF endpoints (confirmed 2026-09-16): `/metrics/v2/protocols/etfs` (issuers), `/metrics/v2/protocols/etfs/assets`
+(per underlying, latest), `/metrics/v2/protocols/etfs/assets/{asset}/metrics/overview/time-series/1d` and
+`/metrics/v2/protocols/etfs/{provider}/metrics/overview/time-series/1d` (both need `start` and `end`).
+Metric keys are normalised to snake_case (`typeSpotUnitedstatesFlowUsd` -> `us_spot_flow_usd`). Flows for
+the latest day arrive as null until Blockworks publishes; the tools print "n/a", never 0. Intel events
+use `GET /intel/v1/events?primaryOrSecondaryAssets=a,b&startTime=...`; signals `GET /signal/v1/assets?assetIds=a,b`.
+
+`list_top_assets` now carries Messari's sector / sub-sector per ticker when the Messari provider is up
+(`TokenUniverse.top_assets(classifier=...)`, Coin Metrics asset ids passed for collision-safe resolution).
 
 Traditional-finance classifications (GICS) and equity / bond / commodity prices are not
 covered by Messari; see the FRED section for the macro series we do have.
@@ -734,8 +748,9 @@ Rows are upserted on that key, so re-running a day is a no-op apart from `captur
 
 ```
 Cloud Scheduler trading-signals-snapshot-daily  (23:30 UTC, POST jobs.run as gm-bot)
-  -> Cloud Run job trading-signals-snapshot      python snapshot_daily.py --sources signals --verbose
-       Coin Metrics + Amberdata (keys from Secret Manager)  ~85 s, 28 tokens, 370 rows
+  -> Cloud Run job trading-signals-snapshot      python snapshot_daily.py --sources signals,etf,cme --verbose
+       Coin Metrics + Amberdata + Messari (keys from Secret Manager)  ~85 s signals (28 tokens, 370 rows)
+       + etf (~90 rows) + cme (~200 rows)
          -> MERGE into BigQuery anchorage-corp-eng-playground.gmask_bot.snapshots
                                                     ^
 local systemd timer (23:30 UTC, best effort)        |   same table, same MERGE
@@ -764,7 +779,7 @@ collapse first); reads filter on `snapshot_date` wherever a window is known so s
 ```bash
 python snapshot_daily.py                          # all three sources for today's UTC date (into the backend from .env)
 python snapshot_daily.py --sources haruko,sheet   # what the local timer runs
-python snapshot_daily.py --sources signals -v     # what the Cloud Run job runs
+python snapshot_daily.py --sources signals,etf,cme -v   # what the Cloud Run job runs
 python snapshot_daily.py --date 2026-09-10        # store under another date (values are still "now")
 python snapshot_daily.py --dry-run -v             # print every row, write nothing
 python scripts/migrate_snapshots_to_bq.py --dry-run   # count local sqlite rows that would be MERGEd
@@ -778,11 +793,14 @@ the others. Each source logs its row count, upstream call count and duration.
 | `haruko` - latest `fct_otc_haruko_pnl_portfolio` row per entity (same query shape as `get_desk_risk_snapshot`) | local timer | `20` (A1 Ltd), `86` (ADSD), `combined` (sum) | `delta_usd`, `delta_adjusted_usd`, `gamma_usd`, `gamma_pct_usd`, `vega`, `theta`, `day_pnl`, `ytd_pnl`, `gross_notional`, `equity`, `valid_pricer_pct` (combined = pricer-count weighted), `data_quality_flag` (value 1 = Normal / 0 = flagged; `value_json` carries the flag text and as-of time) |
 | `signals` - `fetch_token_metrics(FULL_TOKEN_UNIVERSE, 45 days)` -> `calculate_statistical_signals` | Cloud Run job | one per token (`btc`, `eth`, ...) | `<m>` (latest value) and `<m>_z` (z-score) for `spot_volume`, `perp_volume`, `perp_oi`, `total_liquidations` and, where listed, `dvol_close`, `atm_iv_30d`, `pcr_oi`, `options_notional_volume`, `options_block_notional_volume`; `skew_25d_30d` / `pcr_volume_24h` plus `_chg7d`; `price`, `price_pct_change_1d`, `funding_rate` (annualised %). Values are as of the last complete UTC day (`value_json.as_of`). |
 | `sheet` - A1 Metrics Dashboard (`monthly_volume_pnl`, `weekly_pnl`) | local timer | `HOLD`, `A1`, `TOTAL` | `mtd_volume_usd`, `mtd_pnl_usd`, `mtd_take_rate_bps` (latest populated month <= current), `ytd_volume_usd`, `ytd_pnl_usd`, `ytd_take_rate_bps`, `ytd_target_pnl_usd` / `ytd_pct_of_target` (TOTAL), `week_pnl_usd` (latest week), `week_realized_pnl_usd` / `week_unrealized_pnl_usd` (A1) |
+| `etf` - Messari `etf_assets()` (Blockworks) + Coin Metrics `etf_onchain_flows("btc")` | Cloud Run job | `bitcoin`, `ethereum`, `solana`, `xrp`, `multi-asset` ... | `spot_aum_usd`, `spot_flow_usd`, `spot_products`, `futures_aum_usd`, `futures_flow_usd`, `futures_products`, `us_/europe_/apac_spot_aum_usd`, `us_/europe_/apac_spot_flow_usd`, `us_spot_products`, `deltaone_aum_usd`, `leveraged_aum_usd`, `total_volume_usd` (null flows skipped: not yet published); `bitcoin` also `onchain_flow_in_usd`, `onchain_flow_out_usd`, `onchain_net_flow_usd`, `etf_supply_btc`, `etf_supply_usd` (`value_json.vendor` names the source) |
+| `cme` - Coin Metrics `cme_curve(base, include_micro=True)` for btc, eth, sol, xrp | Cloud Run job | contract symbols (`BTCZ6`, `MBTV6` ...) and the underlying (`btc`) | per contract `close`, `oi_contracts`, `oi_usd`, `volume_usd`, `basis_ann_pct`, `days_to_expiry`; per underlying `cme_oi_usd`, `cme_volume_usd`, `front_basis_ann_pct`, `next_basis_ann_pct`, `spot_ref` (`value_json`: front / next contract, spot market and time, basis convention) |
 
 Chat tools (`tools/snapshot_tools.py`, read-only, registered through `chat.default_tools()`):
 
 - `get_snapshot_history(source, metric, entity=None, days=30)` - date | value table with first -> last
-  change and min / max. Default entity: `combined` (haruko), `TOTAL` (sheet); `signals` needs the token.
+  change and min / max. Default entity: `combined` (haruko), `TOTAL` (sheet), `bitcoin` (etf), `btc` (cme);
+  `signals` needs the token; `cme` also takes a contract symbol.
   Haruko entity aliases: `a1` -> `20`, `adsd` -> `86`.
 - `compare_to_snapshot(source, metric, entity, date)` - latest vs the snapshot on that date (falls back to
   the closest earlier one, up to 31 days, and says so).

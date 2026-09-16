@@ -17,7 +17,7 @@
 #     identity token is only accepted by Cloud Run *services*, not by run.googleapis.com.
 #
 # IAM the SA already holds (granted out of band): secretmanager.secretAccessor on the
-# amberdata_key / coinmetrics_trial_api secrets (anchorage-trading-solutions),
+# amberdata_key / coinmetrics_trial_api / messari_api_key2 secrets (anchorage-trading-solutions),
 # bigquery.jobUser on the project, bigquery.dataEditor on dataset gmask_bot,
 # aiplatform.user on anchorage-ai-development, run.invoker on the project (lets the
 # scheduler call jobs.run).
@@ -29,7 +29,7 @@ JOB="${JOB:-trading-signals-snapshot}"
 SCHEDULER_JOB="${SCHEDULER_JOB:-${JOB}-daily}"
 SA="${SA:-gm-bot@${PROJECT}.iam.gserviceaccount.com}"
 SCHEDULE="${SCHEDULE:-30 23 * * *}"        # UTC; the signals source uses the last complete UTC day
-SOURCES="${SOURCES:-signals}"
+SOURCES="${SOURCES:-signals,etf,cme}"   # vendor-key sources; haruko,sheet need the user's own credentials
 
 ENV_VARS="SNAPSHOT_BACKEND=bigquery"
 ENV_VARS+=",SNAPSHOT_BQ_TABLE=${SNAPSHOT_BQ_TABLE:-anchorage-corp-eng-playground.gmask_bot.snapshots}"

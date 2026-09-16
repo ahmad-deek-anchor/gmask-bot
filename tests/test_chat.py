@@ -309,7 +309,8 @@ def test_system_prompt_today_injection():
                       "get_desk_risk_snapshot", "get_perp_positions", "query_desk_data",
                       "remember", "recall", "forget", "what_do_you_remember", "set_channel_rule", "clear_channel_rule",
                       "get_crypto_news", "classify_tokens", "get_sector_members", "list_crypto_sectors",
-                      "get_cme_curve", "get_cme_open_interest", "get_btc_etf_onchain_flows"):
+                      "get_cme_curve", "get_cme_open_interest", "get_btc_etf_onchain_flows",
+                      "get_etf_overview", "get_etf_flows", "get_intel_events", "get_social_signals"):
         assert tool_name in prompt
     assert "## News and classification (Messari)" in prompt
     assert "Desk data (BigQuery)" in prompt and "data_quality_flag" in prompt and "brokerage_a1" in prompt

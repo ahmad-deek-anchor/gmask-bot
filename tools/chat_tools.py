@@ -323,7 +323,8 @@ def list_top_assets(n: int = 100, by: str = "market_cap", include_stables_and_wr
     if universe is None:
         return "The dynamic universe is not available in this environment; curated universe: " + ", ".join(FULL_TOKEN_UNIVERSE)
     try:
-        df = universe.top_assets(n=n, by=by, exclude_stables_and_wrapped=not include_stables_and_wrapped)
+        df = universe.top_assets(n=n, by=by, exclude_stables_and_wrapped=not include_stables_and_wrapped,
+                                 classifier=_sector_classifier())
     except Exception as e:  # noqa: BLE001
         logger.error("list_top_assets failed: %s", e)
         return f"Error building the asset ranking: {type(e).__name__}: {e}"
@@ -331,14 +332,39 @@ def list_top_assets(n: int = 100, by: str = "market_cap", include_stables_and_wr
         return "No ranking data returned by Coin Metrics."
     as_of = df["as_of"].iloc[0]
     label = "estimated market cap" if by == "market_cap" else "24h trusted spot volume"
+    with_sectors = "sector" in df.columns
     lines = [f"### Top {len(df)} assets by {label} (Coin Metrics, as of {as_of})",
-             "| # | ticker | market cap | 24h spot volume | curated |", "|---|---|---|---|---|"]
+             "| # | ticker | market cap | 24h spot volume | curated |" + (" sector | sub-sector |" if with_sectors else ""),
+             "|---|---|---|---|---|" + ("---|---|" if with_sectors else "")]
     for _, r in df.iterrows():
-        lines.append(f"| {int(r['rank'])} | {r['symbol']} | {_fmt_usd(r['market_cap'])} | {_fmt_usd(r['spot_volume'])} | "
-                     f"{'yes' if r['symbol'] in FULL_TOKEN_UNIVERSE else ''} |")
+        line = (f"| {int(r['rank'])} | {r['symbol']} | {_fmt_usd(r['market_cap'])} | {_fmt_usd(r['spot_volume'])} | "
+                f"{'yes' if r['symbol'] in FULL_TOKEN_UNIVERSE else ''} |")
+        if with_sectors:
+            line += f" {_join_list(r.get('sector'))} | {_join_list(r.get('sub_sector'))} |"
+        lines.append(line)
     lines.append("_Tickers here work with every price, candle, metrics and z-score tool. 'Curated' marks the tokens the "
-                 "daily snapshot and full report cover. Stablecoins and wrapped/staked duplicates excluded unless requested._")
+                 "daily snapshot and full report cover. Stablecoins and wrapped/staked duplicates excluded unless requested._"
+                 + (" _Sector / sub-sector are Messari's taxonomy (blank = not classified)._" if with_sectors else ""))
     return "\n".join(lines)
+
+
+def _join_list(v) -> str:
+    if isinstance(v, (list, tuple)):
+        return ", ".join(str(x) for x in v if x)
+    return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
+
+
+def _sector_classifier():
+    """MessariProvider.classify as a ``(symbols, cm_ids) -> frame`` callable, or None without Messari."""
+    try:
+        from providers.factory import get_messari_provider
+        prov = get_messari_provider()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Messari classifier unavailable: %s", e)
+        return None
+    if prov is None:
+        return None
+    return lambda symbols, cm_ids: prov.classify(symbols, cm_ids=cm_ids)
 
 
 @tool("get_token_metrics")

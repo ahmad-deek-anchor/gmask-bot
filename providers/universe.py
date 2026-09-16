@@ -167,8 +167,14 @@ class TokenUniverse:
             self._save_cache()
             return out
 
-    def top_assets(self, n: int = 100, by: str = "market_cap", exclude_stables_and_wrapped: bool = True) -> pd.DataFrame:
-        """Top-``n`` assets by 'market_cap' or 'spot_volume': asset, symbol, market_cap, spot_volume, as_of, rank."""
+    def top_assets(self, n: int = 100, by: str = "market_cap", exclude_stables_and_wrapped: bool = True,
+                   classifier=None) -> pd.DataFrame:
+        """Top-``n`` assets by 'market_cap' or 'spot_volume': rank, asset, symbol, market_cap, spot_volume, as_of.
+
+        ``classifier(symbols, cm_ids)`` (optional, e.g. ``MessariProvider.classify``) returns a frame
+        with ``symbol`` plus ``sector`` / ``sub_sector`` list columns that is left-joined on; the
+        Coin Metrics asset id is passed per symbol so ticker collisions resolve correctly. A failing
+        classifier only logs - the ranking is returned without sectors."""
         if by not in ("market_cap", "spot_volume"):
             raise ValueError("by must be 'market_cap' or 'spot_volume'")
         df = self.ranking()
@@ -178,7 +184,18 @@ class TokenUniverse:
         df = df.assign(symbol=df["asset"].map(display_symbol)).drop_duplicates("symbol", keep="first")
         df = df.head(max(1, int(n))).reset_index(drop=True)
         df = df.assign(rank=range(1, len(df) + 1))
-        return df[["rank", "asset", "symbol", "market_cap", "spot_volume", "as_of"]]
+        out = df[["rank", "asset", "symbol", "market_cap", "spot_volume", "as_of"]]
+        if classifier is not None and len(out):
+            try:
+                cls = classifier(out["symbol"].tolist(), dict(zip(out["symbol"], out["asset"])))
+                if cls is not None and len(cls) and "symbol" in cls.columns:
+                    keep = [c for c in ("sector", "sub_sector") if c in cls.columns]
+                    cls = cls[["symbol"] + keep].drop_duplicates("symbol")
+                    cls["symbol"] = cls["symbol"].astype(str).str.lower()
+                    out = out.merge(cls, on="symbol", how="left")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("top_assets classifier failed: %s", e)
+        return out
 
     def warm(self) -> None:
         """Build the ranking if stale; safe to call from a background thread."""

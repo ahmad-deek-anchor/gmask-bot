@@ -16,3 +16,7 @@ os.environ["UNIVERSE_DISABLED"] = "1"
 os.environ.setdefault("UNIVERSE_CACHE_PATH", os.path.join(tempfile.mkdtemp(prefix="universe-test-"), "universe_cache.json"))
 # providers.messari reads MESSARI_CACHE_PATH at import: keep the suite away from data/messari_assets_cache.json
 os.environ.setdefault("MESSARI_CACHE_PATH", os.path.join(tempfile.mkdtemp(prefix="messari-test-"), "messari_assets_cache.json"))
+# The Slack bot tests exercise handle() with arbitrary users / channels: keep gating off unless a test installs
+# its own AccessControl (tests/test_access.py), and never touch data/access.db.
+os.environ["ACCESS_CONTROL"] = "off"
+os.environ.setdefault("ACCESS_BACKEND", "memory")

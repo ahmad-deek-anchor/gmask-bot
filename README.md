@@ -632,6 +632,48 @@ rows, auth headers, 401 refresh, 403 / 404 / 429 messages, cache TTL, factory) a
 the range cap, the client-flow split: shortcuts, artefacts, missing days, cross-checks) - no
 network, no GCP.
 
+## Access control (who may ask the bot what)
+
+Added 2026-09-16 (`access/`). Every Slack message is checked before the agent runs, and every
+tool call is re-checked when it executes, against a two-part policy:
+
+- **Static** (`deploy/access-policy.yaml`, loaded at start-up): the roles and what they may use
+  (`viewer` = public market data, live prices, news / sectors, ETF, CME, macro, public snapshots,
+  personal memory; `desk` = + the full written report, Haruko risk / PnL / positions, the spot PnL
+  sheet incl. counterparty PnL; `lead` = + raw BigQuery discovery and SQL, shared memory, channel
+  rules; `admin` = everything), the tool groups (every registered tool is in exactly one group;
+  `tests/test_access.py` fails when a new tool is left out), the confidential groups, argument
+  rules (`remember(scope="shared")` needs lead; snapshot sources `haruko` / `sheet` need desk and a
+  confidential place), the denial messages, DM behaviour and the bootstrap admins.
+- **Dynamic** (the access store: BigQuery `gmask_bot.access` on Cloud Run, sqlite `data/access.db`
+  locally, chosen by `ACCESS_BACKEND` which defaults to the snapshot backend): which users hold
+  which role, which channels the bot answers in and whether they are confidential, the default
+  role for unlisted users (viewer, decision 2026-09-16) and the pause switch. Rules are cached for
+  `refresh_seconds` (60) and invalidated immediately by admin commands.
+
+Admins manage it from Slack, no deploy needed (these messages never reach the model):
+
+```
+@GM Bot access help
+@GM Bot access whoami                        anyone: your role and this channel's status
+@GM Bot access list                          lead / admin
+@GM Bot access add user @someone desk        roles: viewer, desk, lead, admin, none
+@GM Bot access remove user @someone
+@GM Bot access add channel here              enable the bot in this channel (public tools)
+@GM Bot access add channel here confidential  ... and allow positions / PnL here
+@GM Bot access remove channel here | #name
+@GM Bot access default viewer                role for unlisted users
+@GM Bot access pause | access resume         everyone but admins
+```
+
+Semantics: a channel that has not been added gets a one-line "not enabled here" reply (admins are
+exempt so they can enable it); DMs are open to everyone with at least the viewer role and count as
+confidential places for desk-role users; confidential tools return "Not permitted ..." to the
+model in public channels, which the prompt tells it to relay. Denied and confidential calls are
+logged under `access.audit` (Cloud Logging). `ACCESS_CONTROL=off` disables gating (local
+experiments; the test suite runs with it off except `tests/test_access.py`). Not built yet: Slack
+user-group sync, per-user quotas, the BigQuery audit table.
+
 ## Long-term memory
 
 The chat agent and the Slack bot share a small persistent memory (`providers/memory_store.py`,

@@ -67,6 +67,8 @@ from zoneinfo import ZoneInfo
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 
+from access.commands import is_access_command, run_access_command
+from access.policy import get_access_control
 from chat import RECURSION_LIMIT, build_chat_agent, load_system_prompt, message_text
 from notifiers.slack import CHUNK_CHARS, chunk_text, to_mrkdwn
 from tools.context import request_context
@@ -418,6 +420,9 @@ async def build_agent(db_path: str | None = None, llm=None, tools=None, system_p
     if tools is None:
         from chat import default_tools
         tools = default_tools() + [current_time]
+        control = get_access_control()
+        if control is not None:
+            tools = control.gate_tools(tools)     # every call re-checks the sender's role and place
     if system_prompt is None:
         system_prompt = load_slack_prompt()
 
@@ -584,6 +589,33 @@ async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, 
     if not text:
         return
     sessions = sessions or get_sessions()
+
+    def _reply_kwargs(body: str) -> dict:
+        kwargs = {"channel": channel, "text": body}
+        if event.get("thread_ts") or (event.get("channel_type") != "im" and REPLY_IN_THREAD):
+            kwargs["thread_ts"] = event.get("thread_ts") or event["ts"]
+        return kwargs
+
+    control = get_access_control()
+    if control is not None:
+        decision = control.decide(user, channel, is_dm)
+        if is_access_command(text):
+            reply = run_access_command(event.get("text", ""), decision, control)
+            await client.chat_postMessage(**_reply_kwargs(reply))
+            log.info("access command channel=%s user=%s role=%s", channel, user, decision.role)
+            return
+        if decision.paused and not decision.is_admin:
+            await client.chat_postMessage(**_reply_kwargs(control.policy.message("paused")))
+            return
+        if decision.role == "none":
+            log.info("denied role channel=%s user=%s", channel, user)
+            await client.chat_postMessage(**_reply_kwargs(control.policy.message("denied_role")))
+            return
+        if not decision.place_ok:
+            log.info("denied place channel=%s user=%s role=%s (%s)", channel, user, decision.role, decision.reason)
+            await client.chat_postMessage(**_reply_kwargs(control.policy.message("denied_place")))
+            return
+
     if is_reset(text):
         sessions.reset(event)
         _flush_closed(agent, sessions)  # summarise the conversation that just ended
@@ -912,7 +944,11 @@ async def run_bot() -> int:
 
 
 async def run_selftest(question: str) -> int:
-    """Exercise the real agent end to end against a recording client. No Slack connection."""
+    """Exercise the real agent end to end against a recording client. No Slack connection.
+    Access control is bypassed (the fake sender is nobody); set ACCESS_CONTROL=on to test gating."""
+    if (os.getenv("ACCESS_CONTROL") or "").lower() != "on":
+        from access.policy import set_access_control
+        set_access_control(None)
     client = RecordingClient()
     event = {"type": "app_mention", "channel": "CSELFTEST", "user": "USELFTEST",
              "ts": "1.000000", "text": f"<@UBOT> {question}"}

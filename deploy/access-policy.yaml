@@ -1,34 +1,44 @@
-# DRAFT - access policy for the GM Slack bot (not enforced yet; see deploy/access-control.md once built).
+# Access policy for the GM Slack bot - the STATIC part (roles, tool groups, messages).
 #
-# Where it lives: Secret Manager secret `gm_bot_access_policy` in anchorage-trading-solutions (YAML,
-# this shape), re-read every `refresh_seconds` by the running bot so membership changes need no
-# redeploy. Locally, ACCESS_POLICY_PATH=deploy/access-policy.yaml overrides the secret.
+# Enforced by access/policy.py: loaded at start-up from ACCESS_POLICY_PATH (default this file).
+# The DYNAMIC part - which users hold which role, which channels the bot answers in, the default
+# role and the pause switch - lives in the access store (BigQuery table gmask_bot.access on Cloud
+# Run, sqlite data/access.db locally) and is edited from Slack by admins:
+#
+#   @GM Bot access help
+#   @GM Bot access add user @someone desk        roles: viewer, desk, lead, admin, none
+#   @GM Bot access add channel here [confidential]
+#   @GM Bot access remove user @someone | remove channel here
+#   @GM Bot access default viewer | pause | resume | list | whoami
 #
 # Evaluation order for every Slack event:
-#   1. kill_switch            -> polite "paused" reply, nothing runs
-#   2. place                  -> channel must be listed (or DMs enabled); otherwise denied_message
-#   3. role                   -> users.by_id, then Slack user groups, then default_role
-#   4. tool set               -> union of the role's tool_groups (plus inherited roles); the agent is
-#                                built with exactly those tools, and every tool call is re-checked
-#                                against this policy at execution time (the wrapper is the control)
-#   5. place sensitivity      -> groups listed under confidential_groups run only in confidential
-#                                places (private channels below, or a DM from a user holding the role)
-#   6. argument rules         -> a few tools branch on an argument (memory scope, snapshot source)
-#   7. limits + audit         -> per-user / per-channel daily counters; every call logged
+#   1. paused (admins exempt)      -> messages.paused, nothing runs
+#   2. place                        -> channel must be in the store (admins exempt; DMs per `dms`)
+#   3. role                         -> bootstrap_admins, then store, then default role
+#   4. tool set                     -> union of the role's tool_groups (inherited); every tool call
+#                                      is checked at execution time (the wrapper is the control)
+#   5. place sensitivity            -> confidential_groups run only in confidential channels or DMs
+#   6. argument rules               -> a few tools branch on an argument (memory scope, snapshot source)
+#   7. audit                        -> every denied or confidential call is logged (Cloud Logging)
 
 version: 1
-refresh_seconds: 300
-kill_switch: false
+refresh_seconds: 60          # how long the store's rules are cached in the bot
 
-# Role for a user who matches nothing below. Decision 2026-09-16 (Ahmad): "viewer" - anyone in the
-# workspace who can reach the bot gets public market data; desk data still needs an explicit role.
+# Always admins, whatever the store says (so access can never be locked out).
+bootstrap_admins:
+  - U0BP6EUTHA9              # Ahmad Deek
+
+# Role for a user who matches nothing. Decision 2026-09-16 (Ahmad): "viewer" - anyone who can reach
+# the bot gets public market data; desk data still needs an explicit role. Admins can change it
+# at runtime with `access default <role>`.
 default_role: viewer
 
 messages:
-  denied_place: "I'm not enabled in this channel. Ask Ahmad to add it, or DM me."
-  denied_role: "You're not on the GM bot access list yet. Ask Ahmad or a GM lead to add you."
-  denied_tool: "That data is limited to the GM desk in private channels. Here is what I can share instead:"
-  paused: "The GM bot is paused for maintenance."
+  denied_place: "I'm not enabled in this channel yet. An admin can enable it with `access add channel here`, or DM me."
+  denied_role: "You're not on the GM bot access list. Ask Ahmad or a GM lead to add you."
+  denied_tool: "Not permitted: {tool} needs the {role_needed} role (you have {role}). Tell the user this data is limited to the GM desk and answer with the public data you can access."
+  denied_place_tool: "Not permitted: {tool} returns confidential desk data and may only be used in a private desk channel or a DM. Tell the user to ask there."
+  paused: "The GM bot is paused for maintenance. Ask Ahmad to resume it."
 
 # ---------------------------------------------------------------------------------------------
 # Roles: each inherits the tool groups of the role it names in `inherits`.
@@ -39,8 +49,9 @@ roles:
     tool_groups: [market, live, news, etf, cme, macro, snapshots, memory_personal]
 
   desk:
-    description: GM desk staff - adds the full report, the desk's own risk, PnL, positions, the spot PnL
-      sheet and counterparty-level PnL (decision 2026-09-16: counterparty PnL sits at desk, not lead).
+    description: >-
+      GM desk staff - adds the full report, the desk's own risk, PnL, positions, the spot PnL
+      sheet and counterparty-level PnL (decision 2026-09-16 - counterparty PnL sits at desk, not lead).
     inherits: viewer
     tool_groups: [market_heavy, desk_risk, spot_pnl, spot_counterparty]
 
@@ -150,45 +161,21 @@ argument_rules:
     confidential: true                      # and only in confidential places
 
 # ---------------------------------------------------------------------------------------------
-# Principals. Slack user ids are stable; user groups are resolved with usergroups.users.list
-# (needs the usergroups:read scope) and cached for refresh_seconds. First match wins in the
-# order: users.by_id, slack_user_groups, google_groups (email via users.info), default_role.
-# ---------------------------------------------------------------------------------------------
-principals:
-  users:
-    by_id:
-      U00AHMAD: admin            # Ahmad Deek (replace with the real Slack user id)
-  slack_user_groups:
-    gm-leads: lead               # @gm-leads   (TO CONFIRM: create or map to an existing group)
-    gm-desk: desk                # @gm-desk    (TO CONFIRM)
-    # no reader group needed: default_role is viewer
-  google_groups: {}              # optional: e.g. data-access-a1-trading-solutions@anchorlabs.com: desk
-
-# ---------------------------------------------------------------------------------------------
-# Places. A channel not listed is denied outright when deny_unlisted_channels is true.
-# Confidential tool groups run only in `confidential` channels or in DMs.
+# Principals and places are DYNAMIC (access store, edited from Slack). Only the DM behaviour and
+# the unlisted-channel rule are fixed here.
 # ---------------------------------------------------------------------------------------------
 places:
-  deny_unlisted_channels: true
-  channels:
-    allowed:
-      - C0BV4T93BT3              # #gm-signals (daily post channel) - replace / extend
-    confidential:
-      - C0GMDESKPRIV             # private #gm-desk channel (replace)
+  deny_unlisted_channels: true # a channel not added with `access add channel` gets messages.denied_place
   dms:
     enabled: true
     min_role: viewer
-    confidential_allowed: true   # a desk-role user may ask for positions in a DM
+    confidential_allowed: true # a desk-role user may ask for positions in a DM
 
-# ---------------------------------------------------------------------------------------------
-# Limits and audit.
-# ---------------------------------------------------------------------------------------------
+# Not built yet (kept as the agreed shape): per-user quotas and the BigQuery audit table.
 limits:
   per_user_daily_requests: 150
   per_channel_daily_requests: 1000
   exempt_roles: [admin]
-
 audit:
   bigquery_table: anchorage-corp-eng-playground.gmask_bot.audit
-  log_arguments: redacted        # none | redacted (tool + argument names) | full (values too)
-  retain_days: 400
+  log_arguments: redacted

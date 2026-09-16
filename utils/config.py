@@ -38,6 +38,13 @@ MEMORY_EMBEDDINGS     env MEMORY_EMBEDDINGS    (default vertex = text-embedding-
 SNAPSHOT_BACKEND      env SNAPSHOT_BACKEND     (default sqlite = snapshots table inside MEMORY_DB_URL; bigquery = shared table below)
 SNAPSHOT_BQ_TABLE     env SNAPSHOT_BQ_TABLE    (default anchorage-corp-eng-playground.gmask_bot.snapshots; written by the Cloud Run job)
 
+Access control for the Slack bot (access/):
+ACCESS_CONTROL        env ACCESS_CONTROL       (default on; off = every Slack user gets every tool)
+ACCESS_POLICY_PATH    env ACCESS_POLICY_PATH   (default deploy/access-policy.yaml; roles, tool groups, bootstrap admins)
+ACCESS_BACKEND        env ACCESS_BACKEND       (default = SNAPSHOT_BACKEND: sqlite locally, bigquery on Cloud Run)
+ACCESS_DB_PATH        env ACCESS_DB_PATH       (default data/access.db; sqlite backend)
+ACCESS_BQ_TABLE       env ACCESS_BQ_TABLE      (default anchorage-corp-eng-playground.gmask_bot.access)
+
 Spot desk PnL in the "A1 Metrics Dashboard" Google Sheet (providers/gsheets.py, read-only):
 A1_METRICS_SHEET_ID   env A1_METRICS_SHEET_ID  (default 1BksNxC2QXHLjFJNCuv-GC9JOBHeb8EyoGwzTuNwqNSY)
 GSHEETS_QUOTA_PROJECT env GSHEETS_QUOTA_PROJECT (default anchorage-corp-eng-playground; x-goog-user-project)

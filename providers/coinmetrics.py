@@ -69,14 +69,24 @@ MAX_TAPE_MINUTES = 60                     # market trades: cap the tape window a
 
 
 def asset_id_for(token: str) -> str:
-    """Map a token symbol to its Coin Metrics asset id."""
+    """Map a token symbol to its Coin Metrics asset id (curated mapping only; the provider
+    consults the dynamic universe for symbols outside it)."""
     return ASSET_MAP.get(token.lower(), token.lower())
 
 
 def spot_markets_for(token: str) -> list[str]:
-    """Candidate Coin Metrics spot market ids for a token, in preference order."""
+    """Curated candidate spot market ids for a token, in preference order (no network)."""
     asset_id = asset_id_for(token)
     return [f"{ex}-{asset_id}-{quote}-spot" for ex, quote in EXCHANGE_AVAILABILITY.get(token.lower(), DEFAULT_EXCHANGES)]
+
+
+def is_curated(token: str) -> bool:
+    """True when the token is in the curated universe (tools.metrics.FULL_TOKEN_UNIVERSE)."""
+    try:
+        from tools.metrics import FULL_TOKEN_UNIVERSE
+    except Exception:  # noqa: BLE001
+        return True
+    return token.lower() in FULL_TOKEN_UNIVERSE
 
 
 def _normalize_time(df: pd.DataFrame) -> pd.DataFrame:
@@ -99,8 +109,43 @@ def _utc_iso(dt: datetime) -> str:
 
 class CoinMetricsProvider(MarketDataProvider):
 
-    def __init__(self, client):
+    def __init__(self, client, universe=None):
         self._client = client
+        self._universe = universe   # providers.universe.TokenUniverse, built lazily
+
+    @property
+    def universe(self):
+        """Dynamic token universe (symbol resolution, market discovery, top-N ranking)."""
+        if self._universe is None:
+            from providers.universe import TokenUniverse
+            self._universe = TokenUniverse(self._client)
+        return self._universe
+
+    def _asset_id(self, token: str) -> str:
+        """Curated mapping for curated tokens; otherwise the dynamic universe (falls back to the symbol)."""
+        t = token.lower()
+        if t in ASSET_MAP or is_curated(t):
+            return asset_id_for(t)
+        try:
+            return self.universe.resolve(t) or t
+        except Exception as e:  # noqa: BLE001
+            logger.debug("universe.resolve(%s) failed: %s", t, e)
+            return t
+
+    def _spot_markets(self, token: str) -> list[str]:
+        """Curated market list for curated tokens; discovered live markets for everything else."""
+        t = token.lower()
+        if t in EXCHANGE_AVAILABILITY or is_curated(t):
+            return spot_markets_for(t)
+        try:
+            asset_id = self.universe.resolve(t)
+            if asset_id:
+                found = self.universe.spot_markets(asset_id)
+                if found:
+                    return found
+        except Exception as e:  # noqa: BLE001
+            logger.debug("universe.spot_markets(%s) failed: %s", t, e)
+        return spot_markets_for(t)
 
     # ------------------------------------------------------------------
     # Internal fetch helpers
@@ -110,7 +155,7 @@ class CoinMetricsProvider(MarketDataProvider):
         """One daily asset metric as (time, <metric>) or None on any failure / empty."""
         try:
             df = self._client.get_asset_metrics(
-                assets=[asset_id_for(token)], metrics=[metric],
+                assets=[self._asset_id(token)], metrics=[metric],
                 start_time=start_date.strftime("%Y-%m-%d"), end_time=end_date.strftime("%Y-%m-%d"),
                 frequency="1d",
             ).to_dataframe()
@@ -140,7 +185,7 @@ class CoinMetricsProvider(MarketDataProvider):
     def _candles(self, token: str, start_date: datetime, end_date: datetime) -> list[pd.DataFrame]:
         """Daily candles from every spot market of the token that returns data (preference order)."""
         frames = []
-        for market in spot_markets_for(token):
+        for market in self._spot_markets(token):
             df = self._market_candles(market, start_date, end_date)
             if df is not None:
                 frames.append(df)
@@ -209,7 +254,7 @@ class CoinMetricsProvider(MarketDataProvider):
     # ------------------------------------------------------------------
 
     def _markets(self, token: str, market: Optional[str]) -> list[str]:
-        return [market] if market else spot_markets_for(token)
+        return [market] if market else self._spot_markets(token)
 
     def get_intraday_candles(
         self, token: str, frequency: str = "5m", lookback_minutes: int = 180, market: Optional[str] = None
@@ -356,7 +401,7 @@ class CoinMetricsProvider(MarketDataProvider):
     ) -> Optional[pd.DataFrame]:
         if token.lower() in TOKENS_WITHOUT_LIQUIDATIONS:
             return None
-        pair = f"{asset_id_for(token)}-usd"
+        pair = f"{self._asset_id(token)}-usd"
         buy, sell = "liquidations_reported_future_buy_usd_1d", "liquidations_reported_future_sell_usd_1d"
         try:
             df = self._client.get_pair_metrics(

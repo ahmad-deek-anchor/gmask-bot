@@ -295,7 +295,7 @@ def _in_universe(token: Optional[str]) -> bool:
         return False
     try:
         from tools.metrics import FULL_TOKEN_UNIVERSE
-        return token in FULL_TOKEN_UNIVERSE
+        return token in FULL_TOKEN_UNIVERSE   # curated universe flag (display only, no network)
     except Exception:  # noqa: BLE001
         return False
 

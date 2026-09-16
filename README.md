@@ -161,6 +161,81 @@ Values are the latest complete UTC day.
 Token-level notes: `pol` is Coin Metrics asset `pol` (the old `matic` markets are dead);
 `sky` is `sky_sky` (`sky` is Skycoin). Both are mapped in `providers/coinmetrics.py`.
 
+## Token universe: curated list plus any Coin Metrics asset
+
+Added 2026-09-16. Two tiers:
+
+- **Curated universe** (`tools.metrics.FULL_TOKEN_UNIVERSE`, ~28 tokens): what the daily
+  snapshot job, `run_signals.py` and the full written report cover. Every token here costs
+  API calls and model time per day, so this list stays deliberate.
+- **On demand**: every chat tool (prices, candles, metrics, z-scores, tape) accepts any asset
+  Coin Metrics tracks. `tools.metrics.resolve_token` accepts curated tokens directly and
+  otherwise asks `providers.universe.TokenUniverse` (reached through
+  `providers.factory.get_universe()`, the Coin Metrics provider's `.universe`); with no
+  universe available (tests, fake providers) only the curated list counts.
+
+`TokenUniverse` (`providers/universe.py`): `resolve(symbol)` maps a ticker to the Coin Metrics
+asset id (`tao` -> `tao_bittensor`, `sky` -> `sky_sky`, largest market cap wins when several
+ids share a prefix); `spot_markets(asset_id)` discovers live spot markets from
+`catalog_market_candles_v2` in a fixed exchange preference (Coinbase USD, Kraken USD,
+Binance USDT, ...), dropping markets with no candle in 7 days; `top_assets(n, by)` ranks by
+`CapMrktEstUSD` or `volume_trusted_spot_usd_1d`, excluding stablecoins, gold tokens and
+wrapped / staked duplicates (`STABLES_AND_WRAPPED`) unless asked. The ranking is 6 API
+calls (~20 s on our key, ~840 assets), cached for 24 h in memory and in
+`data/universe_cache.json`; the Cloud Run entrypoint warms it in a background thread at
+start-up. The provider uses curated market lists for curated tokens (no network) and the
+universe for everything else.
+
+Tool: `list_top_assets(n=100, by="market_cap", include_stables_and_wrapped=False)`; the
+`list_token_universe` output now explains the two tiers. Coverage caveat: spot is near
+universal; Amberdata derivatives and Deribit options cover far fewer assets, so an
+off-list token can return spot data with empty perp / options columns.
+
+Tests: `tests/test_universe.py` (fake client, no network).
+
+## News and sector classification (Messari)
+
+Added 2026-09-16. `providers/messari.py` wraps Messari's Enterprise API (secret
+`messari_api_key2`; the older `messari_api_key` is dead) behind `MessariProvider`, reached
+through `providers.factory.get_messari_provider()` (None when no key). It reuses the Amberdata
+HTTP plumbing (`providers/_http.py`, now parameterised on header name and retry statuses),
+memoises every call with a TTL and caches Messari's ranked asset table (about 4,500 assets
+with rank > 0, 7-8 requests, ~4 s) for 24 h in `data/messari_assets_cache.json`
+(`MESSARI_CACHE_PATH`); the Cloud Run entrypoint warms it at start-up.
+
+What the key gives us (checked 2026-09-16): the curated news feed (about 420 news-outlet items
+a day plus blogs and forums; publish time, source, link, tagged assets, model sentiment), the
+asset taxonomy (`sectorV2` - DeFi, Networks, AI, Meme, DePIN, Stablecoins, Gaming, NFTs, CeFi,
+Tools, Blockchain Infrastructure, Others; `subSectorV2` ~100 names such as Layer-1, Layer-2,
+Decentralized Exchange, Real World Assets, Privacy; `tags`), ETF issuer / asset tables and
+time series, Intel events and mindshare signals. Research reports return 403.
+
+Known vendor quirk: filtering the news feed by asset (`assetIds=`) times out (HTTP 524 or a
+client timeout) almost every time. `MessariProvider.news()` tries the filtered call once with
+a 12 s timeout and then falls back to scanning the unfiltered feed (up to 8 pages of 100) and
+matching items by Messari's asset tags or by ticker / project name in the title; the tool says
+so in its footer because body-only mentions are missed.
+
+Ticker resolution (`asset_record` / `slug_for`): a small override table (btc, eth, sol, hype,
+tao -> `bittensor-0`, sky -> `sky-protocol`, pol -> `polygon-ecosystem-token`), then an exact
+symbol (or slug / name) match in the ranked table, then Messari's `search=`. Tickers shared by
+several assets (SKY) resolve to the best-ranked one unless the Coin Metrics asset id carries a
+qualifier (`sky_sky`, `tao_bittensor`), which the tools pass along when the universe is up.
+
+Tools (`tools/messari_tools.py`, registered after the intraday tools):
+
+| Tool | What it answers |
+|---|---|
+| `get_crypto_news(tokens=[], hours=24, limit=15, include_blogs=False)` | headlines for up to 5 tokens or the market: UTC time, source, link, tagged assets, Messari sentiment |
+| `classify_tokens(tokens)` | Messari sector / sub-sector / tags and rank per ticker |
+| `get_sector_members(sector, n=25)` | constituents of a sector, sub-sector or tag ("DePIN", "Layer-2", "Proof-of-Work") by rank |
+| `list_crypto_sectors()` | the taxonomy: sectors, sub-sectors, counts, largest tickers |
+
+Traditional-finance classifications (GICS) and equity / bond / commodity prices are not
+covered by Messari; see the FRED section for the macro series we do have.
+
+Tests: `tests/test_messari.py` (fake session, no network).
+
 ## Live and intraday prices (Coin Metrics market data)
 
 Added 2026-09-16. The Coin Metrics key has full, undelayed access to the market-level

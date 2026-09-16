@@ -33,6 +33,33 @@ FULL_TOKEN_UNIVERSE = [
 
 TEST_TOKEN_UNIVERSE = ["btc", "eth", "sol", "sui", "hype", "uni", "jto"]
 
+
+def resolve_token(symbol: str) -> Optional[str]:
+    """Lowercase symbol if it is usable by the data tools, else None.
+
+    Curated tokens (FULL_TOKEN_UNIVERSE) always resolve. Anything else resolves when the
+    dynamic Coin Metrics universe knows the asset (providers.universe.TokenUniverse via
+    providers.factory.get_universe()); when no universe is available (tests, fake providers)
+    only the curated list counts. Never raises.
+    """
+    s = (symbol or "").strip().lower()
+    if not s:
+        return None
+    if s in FULL_TOKEN_UNIVERSE:
+        return s
+    try:
+        from providers.factory import get_universe
+        universe = get_universe()
+        if universe is not None and universe.is_known(s):
+            return s
+    except Exception as e:  # noqa: BLE001
+        logger.debug("resolve_token(%s): universe lookup failed: %s", s, e)
+    return None
+
+
+def is_supported_token(symbol: str) -> bool:
+    return resolve_token(symbol) is not None
+
 # Z-score thresholds and rolling window (days)
 OUTLIER_THRESHOLD = 2.5
 INSIGNIFICANT_THRESHOLD = 1.0

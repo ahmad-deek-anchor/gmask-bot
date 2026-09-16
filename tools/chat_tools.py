@@ -38,6 +38,7 @@ from langchain_core.tools import tool
 from tools import metrics as _metrics
 from tools.metrics import (
     FULL_TOKEN_UNIVERSE,
+    resolve_token,
     INSIGNIFICANT_THRESHOLD,
     OPTIONS_DAILY_METRICS,
     OPTIONS_EXCHANGE,
@@ -93,12 +94,22 @@ def _normalise_tokens(tokens) -> List[str]:
 
 
 def validate_tokens(tokens) -> tuple[List[str], List[str], List[str]]:
-    """Split requested tokens into (valid, unknown, dropped_over_cap)."""
+    """Split requested tokens into (valid, unknown, dropped_over_cap).
+
+    A token is valid when it is in the curated universe or when the dynamic Coin Metrics
+    universe knows the asset (``tools.metrics.resolve_token``), so any of the top ~800
+    assets by market cap works, not only the curated ~28.
+    """
     requested = _normalise_tokens(tokens)
-    valid = [t for t in requested if t in FULL_TOKEN_UNIVERSE]
-    unknown = [t for t in requested if t not in FULL_TOKEN_UNIVERSE]
+    valid = [t for t in requested if resolve_token(t)]
+    unknown = [t for t in requested if t not in valid]
     dropped = valid[MAX_TOKENS_PER_CALL:]
     return valid[:MAX_TOKENS_PER_CALL], unknown, dropped
+
+
+def _unknown_token_message(token: str) -> str:
+    return (f"Unknown token '{token}': Coin Metrics has no asset by that symbol. Check the ticker, or call "
+            f"list_top_assets for the top assets by market cap. Curated universe: {', '.join(FULL_TOKEN_UNIVERSE)}.")
 
 
 def _notes(unknown: List[str], dropped: List[str]) -> List[str]:
@@ -106,7 +117,7 @@ def _notes(unknown: List[str], dropped: List[str]) -> List[str]:
     if unknown:
         notes.append(
             f"Unknown token(s) ignored: {', '.join(t.upper() for t in unknown)} "
-            f"(not in the supported universe; call list_token_universe)."
+            f"(no Coin Metrics asset by that symbol; call list_top_assets or list_token_universe)."
         )
     if dropped:
         notes.append(
@@ -227,7 +238,7 @@ def _options_gate(token: str):
     """
     valid, _, _ = validate_tokens([token])
     if not valid:
-        return None, None, f"Unknown token '{token}'. Supported symbols: {', '.join(FULL_TOKEN_UNIVERSE)}."
+        return None, None, _unknown_token_message(token)
     tok = valid[0]
     try:
         provider = _options_provider()
@@ -270,18 +281,64 @@ def _fetch_metrics(tokens: List[str], days: int):
 
 @tool("list_token_universe")
 def list_token_universe() -> str:
-    """List every token symbol the data tools support, plus the default test universe.
+    """List the curated token universe (what the daily reports and snapshots cover) and explain that any Coin Metrics asset can be queried on demand.
 
-    Call this when the user asks which tokens are covered, or before querying a
-    symbol you are not sure is supported. Symbols are lowercase tickers
-    (e.g. 'btc', 'eth', 'sol').
+    Call this when the user asks which tokens are covered. Symbols are lowercase tickers
+    (e.g. 'btc', 'eth', 'sol'). For "what are the top 100 tokens" use list_top_assets.
     """
     return json.dumps({
         "full_universe": FULL_TOKEN_UNIVERSE,
         "count": len(FULL_TOKEN_UNIVERSE),
         "test_universe": TEST_TOKEN_UNIVERSE,
         "max_tokens_per_call": MAX_TOKENS_PER_CALL,
+        "on_demand": "Any asset Coin Metrics tracks (~800 with market cap data) works with every price, "
+                     "candle, metrics and z-score tool; just pass its ticker. The curated list is what the "
+                     "daily snapshot and the full report cover. Use list_top_assets(n) to see the top assets "
+                     "by market cap or spot volume.",
     })
+
+
+@tool("list_top_assets")
+def list_top_assets(n: int = 100, by: str = "market_cap", include_stables_and_wrapped: bool = False) -> str:
+    """Top-N crypto assets by estimated market cap (default) or 24h trusted spot volume, from Coin Metrics.
+
+    Use for "top 100 tokens", "largest assets", "what are the biggest coins", or to find the
+    ticker for an asset before calling a price / metrics tool. Stablecoins, gold tokens and
+    wrapped or staked duplicates (USDT, WBTC, stETH ...) are excluded unless asked for.
+
+    Args:
+        n: How many assets (default 100, max 300).
+        by: 'market_cap' (default) or 'spot_volume'.
+        include_stables_and_wrapped: Include stablecoins, gold tokens and wrapped/staked duplicates (default False).
+
+    Returns:
+        Markdown table: rank, ticker, market cap, 24h trusted spot volume, and whether the asset is
+        in the curated universe (covered by the daily reports). Data is daily, as of the date shown.
+    """
+    from providers.factory import get_universe
+
+    n = max(1, min(int(n), 300))
+    by = "spot_volume" if str(by).lower().startswith("vol") else "market_cap"
+    universe = get_universe()
+    if universe is None:
+        return "The dynamic universe is not available in this environment; curated universe: " + ", ".join(FULL_TOKEN_UNIVERSE)
+    try:
+        df = universe.top_assets(n=n, by=by, exclude_stables_and_wrapped=not include_stables_and_wrapped)
+    except Exception as e:  # noqa: BLE001
+        logger.error("list_top_assets failed: %s", e)
+        return f"Error building the asset ranking: {type(e).__name__}: {e}"
+    if df.empty:
+        return "No ranking data returned by Coin Metrics."
+    as_of = df["as_of"].iloc[0]
+    label = "estimated market cap" if by == "market_cap" else "24h trusted spot volume"
+    lines = [f"### Top {len(df)} assets by {label} (Coin Metrics, as of {as_of})",
+             "| # | ticker | market cap | 24h spot volume | curated |", "|---|---|---|---|---|"]
+    for _, r in df.iterrows():
+        lines.append(f"| {int(r['rank'])} | {r['symbol']} | {_fmt_usd(r['market_cap'])} | {_fmt_usd(r['spot_volume'])} | "
+                     f"{'yes' if r['symbol'] in FULL_TOKEN_UNIVERSE else ''} |")
+    lines.append("_Tickers here work with every price, candle, metrics and z-score tool. 'Curated' marks the tokens the "
+                 "daily snapshot and full report cover. Stablecoins and wrapped/staked duplicates excluded unless requested._")
+    return "\n".join(lines)
 
 
 @tool("get_token_metrics")
@@ -307,7 +364,7 @@ def get_token_metrics(token: str, days: int = 45) -> str:
     days = _clamp_days(days, 45)
     valid, unknown, _ = validate_tokens([token])
     if not valid:
-        return f"Unknown token '{token}'. Supported symbols: {', '.join(FULL_TOKEN_UNIVERSE)}."
+        return _unknown_token_message(token)
     tok = valid[0]
 
     try:
@@ -491,7 +548,7 @@ def get_price_history(token: str, days: int = 30) -> str:
     days = _clamp_days(days, 30)
     valid, _, _ = validate_tokens([token])
     if not valid:
-        return f"Unknown token '{token}'. Supported symbols: {', '.join(FULL_TOKEN_UNIVERSE)}."
+        return _unknown_token_message(token)
     tok = valid[0]
 
     try:
@@ -875,6 +932,7 @@ def get_chat_tools() -> list:
 
     return [
         list_token_universe,
+        list_top_assets,
         get_token_metrics,
         get_zscore_signals,
         get_price_history,
@@ -890,6 +948,7 @@ def get_chat_tools() -> list:
 __all__ = [
     "MAX_TOKENS_PER_CALL",
     "get_chat_tools",
+    "list_top_assets",
     "get_gamma_exposure",
     "get_options_flow",
     "get_options_snapshot",

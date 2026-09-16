@@ -7,5 +7,12 @@ client (tests/test_snapshot_bq.py) or monkeypatch the variable themselves.
 """
 
 import os
+import tempfile
 
 os.environ["SNAPSHOT_BACKEND"] = "sqlite"
+# Never build a real market-data provider for token resolution inside the suite (see providers.factory.get_universe)
+os.environ["UNIVERSE_DISABLED"] = "1"
+# providers.universe reads UNIVERSE_CACHE_PATH at import: keep the test suite away from data/universe_cache.json
+os.environ.setdefault("UNIVERSE_CACHE_PATH", os.path.join(tempfile.mkdtemp(prefix="universe-test-"), "universe_cache.json"))
+# providers.messari reads MESSARI_CACHE_PATH at import: keep the suite away from data/messari_assets_cache.json
+os.environ.setdefault("MESSARI_CACHE_PATH", os.path.join(tempfile.mkdtemp(prefix="messari-test-"), "messari_assets_cache.json"))

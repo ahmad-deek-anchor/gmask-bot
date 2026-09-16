@@ -245,7 +245,8 @@ def test_run_full_signals_analysis_uses_workflow(monkeypatch):
 def test_get_chat_tools_names():
     names = [t.name for t in get_chat_tools()]
     assert names == [
-        "list_token_universe", "get_token_metrics", "get_zscore_signals",
+        "list_token_universe",
+        "list_top_assets", "get_token_metrics", "get_zscore_signals",
         "get_price_history", "run_full_signals_analysis", "get_multi_day_signals_tool",
         "get_options_snapshot", "get_vol_term_structure", "get_options_flow", "get_gamma_exposure",
     ]
@@ -258,6 +259,7 @@ def test_default_tools_include_desk_tools():
     from tools.sheet_tools import SHEET_TOOL_NAMES
 
     from tools.intraday_tools import get_intraday_tools
+    from tools.messari_tools import MESSARI_TOOL_NAMES
 
     names = [t.name for t in chat.default_tools()]
     intraday = [t.name for t in get_intraday_tools()]
@@ -265,6 +267,8 @@ def test_default_tools_include_desk_tools():
     assert names[:n_chat] == [t.name for t in get_chat_tools()]
     assert names[n_chat:n_chat + n_intra] == intraday
     n_after_intra = n_chat + n_intra
+    assert names[n_after_intra:n_after_intra + len(MESSARI_TOOL_NAMES)] == MESSARI_TOOL_NAMES
+    n_after_intra += len(MESSARI_TOOL_NAMES)
     assert names[n_after_intra:n_after_intra + n_desk] == DESK_TOOL_NAMES
     assert names[n_after_intra + n_desk:n_after_intra + n_desk + n_sheet] == SHEET_TOOL_NAMES
     n_fixed = n_after_intra + n_desk + n_sheet
@@ -300,8 +304,10 @@ def test_system_prompt_today_injection():
     for tool_name in ("get_zscore_signals", "get_token_metrics", "get_price_history",
                       "run_full_signals_analysis", "list_token_universe",
                       "get_desk_risk_snapshot", "get_perp_positions", "query_desk_data",
-                      "remember", "recall", "forget", "what_do_you_remember", "set_channel_rule", "clear_channel_rule"):
+                      "remember", "recall", "forget", "what_do_you_remember", "set_channel_rule", "clear_channel_rule",
+                      "get_crypto_news", "classify_tokens", "get_sector_members", "list_crypto_sectors"):
         assert tool_name in prompt
+    assert "## News and classification (Messari)" in prompt
     assert "Desk data (BigQuery)" in prompt and "data_quality_flag" in prompt and "brokerage_a1" in prompt
     assert "## Long-term memory" in prompt and "<memories>" in prompt
     assert "Never store positions, PnL" in prompt and "forget everything about" in prompt

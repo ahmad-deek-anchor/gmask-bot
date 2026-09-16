@@ -37,8 +37,32 @@ async def _serve_health() -> web.AppRunner:
     return runner
 
 
+async def _warm_universe() -> None:
+    """Build the daily market-cap ranking in a worker thread so the first 'top 100' answer is fast."""
+    try:
+        from providers.factory import get_universe
+        universe = await asyncio.to_thread(get_universe)
+        if universe is not None:
+            await asyncio.to_thread(universe.warm)
+    except Exception as e:  # noqa: BLE001
+        log.warning("universe warm-up skipped: %s", e)
+
+
+async def _warm_messari() -> None:
+    """Pull Messari's ranked asset table (sector taxonomy) so the first classification answer is fast."""
+    try:
+        from providers.factory import get_messari_provider
+        prov = await asyncio.to_thread(get_messari_provider)
+        if prov is not None:
+            await asyncio.to_thread(prov.warm)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Messari warm-up skipped: %s", e)
+
+
 async def _main() -> int:
     runner = await _serve_health()
+    asyncio.create_task(_warm_universe())
+    asyncio.create_task(_warm_messari())
     try:
         return await slack_bot.run_bot()
     finally:

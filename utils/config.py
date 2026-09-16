@@ -9,6 +9,8 @@ Attributes
 ----------
 COINMETRICS_API_KEY   env COINMETRICS_API_KEY  | secret coinmetrics_trial_api
 AMBERDATA_API_KEY     env AMBERDATA_API_KEY    | secret amberdata_key
+MESSARI_API_KEY       env MESSARI_API_KEY      | secret messari_api_key2  (Enterprise; news, taxonomy, ETF, Intel, signals)
+MESSARI_CACHE_PATH    env MESSARI_CACHE_PATH   (default data/messari_assets_cache.json; 24 h ranked-asset table, read by providers.messari at import)
 SLACK_BOT_TOKEN       env SLACK_BOT_TOKEN      | secret trading_signals_slack_bot_token   (xoxb-)
 SLACK_APP_TOKEN       env SLACK_APP_TOKEN      | secret trading_signals_slack_app_token   (xapp-)
 SLACK_CHANNEL_ID      env SLACK_CHANNEL_ID     | secret trading_signals_slack_channel_id  (daily post target)
@@ -92,6 +94,7 @@ DEFAULT_GSHEETS_CACHE_TTL_S = 300
 # Secret Manager names (project DEFAULT_SECRETS_PROJECT)
 SECRET_COINMETRICS = "coinmetrics_trial_api"
 SECRET_AMBERDATA = "amberdata_key"
+SECRET_MESSARI = "messari_api_key2"         # messari_api_key (v1) is dead: 403 on every endpoint
 SECRET_SLACK_BOT_TOKEN = "trading_signals_slack_bot_token"
 SECRET_SLACK_APP_TOKEN = "trading_signals_slack_app_token"
 SECRET_SLACK_CHANNEL_ID = "trading_signals_slack_channel_id"
@@ -165,6 +168,10 @@ class Config:
     @cached_property
     def AMBERDATA_API_KEY(self) -> Optional[str]:
         return self._resolve("AMBERDATA_API_KEY", SECRET_AMBERDATA)
+
+    @cached_property
+    def MESSARI_API_KEY(self) -> Optional[str]:
+        return self._resolve("MESSARI_API_KEY", SECRET_MESSARI)
 
     # Slack bot (Bolt Socket Mode) + daily post target. Lazy: only read by
     # slack_bot.py and by run_signals.py --post-slack.

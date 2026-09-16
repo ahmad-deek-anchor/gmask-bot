@@ -90,32 +90,45 @@ class AmberdataHTTP:
         timeout: int = 30,
         max_retries: int = 3,
         backoff: float = 1.0,
+        header_name: str = "x-api-key",
+        retry_statuses: Optional[set] = None,
+        label: str = "Amberdata",
     ):
+        """``header_name`` / ``retry_statuses`` / ``label`` let other vendors with the same
+        envelope-and-retry needs (providers.messari) reuse this class unchanged."""
         self.session = session or requests.Session()
         self.session.headers.update({
-            "x-api-key": api_key,
+            header_name: api_key,
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate",
         })
         self.timeout = timeout
         self.max_retries = max_retries
         self.backoff = backoff
+        self.retry_statuses = set(retry_statuses) if retry_statuses is not None else set(RETRY_STATUSES)
+        self.label = label
         self.call_count = 0
         self.last_status: Optional[int] = None
         self.last_error: str = ""
 
     # ------------------------------------------------------------------
 
-    def request(self, url: str, params: Optional[dict]) -> Optional[dict]:
-        """GET with retry/backoff on 429/5xx. Returns parsed JSON or None."""
+    def request(self, url: str, params: Optional[dict], timeout: Optional[float] = None,
+                retries: Optional[int] = None) -> Optional[dict]:
+        """GET with retry/backoff on 429/5xx. Returns parsed JSON or None.
+
+        ``timeout`` / ``retries`` override the instance defaults for this one call (a
+        caller that knows an endpoint is flaky can fail fast and fall back)."""
         attempt = 0
+        timeout = self.timeout if timeout is None else timeout
+        max_retries = self.max_retries if retries is None else max(0, int(retries))
         while True:
             self.call_count += 1
             try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
+                resp = self.session.get(url, params=params, timeout=timeout)
             except requests.RequestException as e:
-                if attempt >= self.max_retries:
-                    logger.warning("Amberdata request failed %s: %s", url, e)
+                if attempt >= max_retries:
+                    logger.warning("%s request failed %s: %s", self.label, url, e)
                     self.last_status, self.last_error = None, str(e)
                     return None
                 attempt += 1
@@ -127,12 +140,12 @@ class AmberdataHTTP:
                 try:
                     data = resp.json()
                 except ValueError as e:
-                    logger.warning("Amberdata non-JSON response %s: %s", url, e)
+                    logger.warning("%s non-JSON response %s: %s", self.label, url, e)
                     self.last_status, self.last_error = status, "non-JSON response"
                     return None
                 self.last_status, self.last_error = None, ""
                 return data
-            if status in RETRY_STATUSES and attempt < self.max_retries:
+            if status in self.retry_statuses and attempt < max_retries:
                 attempt += 1
                 delay = self.backoff * (2 ** (attempt - 1))
                 retry_after = resp.headers.get("Retry-After")
@@ -141,20 +154,20 @@ class AmberdataHTTP:
                         delay = max(delay, float(retry_after))
                     except ValueError:
                         pass
-                logger.info("Amberdata HTTP %s on %s — retry %d/%d in %.1fs",
-                            status, url, attempt, self.max_retries, delay)
+                logger.info("%s HTTP %s on %s — retry %d/%d in %.1fs",
+                            self.label, status, url, attempt, max_retries, delay)
                 time.sleep(delay)
                 continue
 
             body = resp.text[:300] if resp.text else ""
             self.last_status, self.last_error = status, _error_message(resp, body)
             if status in AUTH_STATUSES:
-                logger.warning("Amberdata HTTP %s (auth/tier) on %s params=%s: %s",
-                               status, url, params, body)
+                logger.warning("%s HTTP %s (auth/tier) on %s params=%s: %s",
+                               self.label, status, url, params, body)
             elif status == 404:
-                logger.info("Amberdata HTTP 404 on %s params=%s", url, params)
+                logger.info("%s HTTP 404 on %s params=%s", self.label, url, params)
             else:
-                logger.warning("Amberdata HTTP %s on %s params=%s: %s", status, url, params, body)
+                logger.warning("%s HTTP %s on %s params=%s: %s", self.label, status, url, params, body)
             return None
 
     def get_rows(self, url: str, params: dict, max_pages: int = DEFAULT_MAX_PAGES) -> Optional[list]:

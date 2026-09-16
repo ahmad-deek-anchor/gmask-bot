@@ -16,6 +16,10 @@ Application Default Credentials are unavailable.
 (read-only spot desk PnL from the "A1 Metrics Dashboard" Google Sheet), or None
 when google-auth cannot resolve Application Default Credentials.
 
+`get_messari_provider()` returns a process-wide providers.messari.MessariProvider
+(news, sector taxonomy, ETF flows, Intel, signals), or None when no Messari key is
+configured.
+
 There is no local cache; every call hits the upstream API. API keys come from
 utils.config.Config (env var override, else GCP Secret Manager).
 """
@@ -70,11 +74,33 @@ def get_provider() -> MarketDataProvider:
     return _provider
 
 
+def get_universe():
+    """The dynamic TokenUniverse behind the spot provider, or None when it has none.
+
+    With ``UNIVERSE_DISABLED=1`` (set by tests/conftest.py) this returns None instead of
+    building a real provider (Secret Manager + network) when no provider exists yet and
+    ``get_provider`` has not been replaced by a test double.
+    """
+    import os
+    if os.getenv("UNIVERSE_DISABLED") == "1" and _provider is None and get_provider is _ORIGINAL_GET_PROVIDER:
+        return None
+    provider = get_provider()
+    spot = getattr(provider, "spot", provider)
+    try:
+        return spot.universe
+    except AttributeError:
+        return None
+
+
 def reset_provider() -> None:
     """Force re-initialisation on next get_provider() call (useful for tests)."""
     global _provider
     _provider = None
     reset_options_provider()
+    reset_messari_provider()
+
+
+_ORIGINAL_GET_PROVIDER = get_provider   # get_universe() compares against this to detect test doubles
 
 
 # ----------------------------------------------------------------------
@@ -210,6 +236,55 @@ def reset_a1_metrics_sheet() -> None:
     with _a1_sheet_lock:
         _a1_sheet = None
         _a1_sheet_built = False
+
+
+# ----------------------------------------------------------------------
+# Messari (news, taxonomy, ETF, Intel, signals)
+# ----------------------------------------------------------------------
+
+_messari = None
+_messari_built = False
+_messari_lock = threading.Lock()
+
+
+def get_messari_provider():
+    """Shared MessariProvider, or None when no Messari key is available.
+
+    The result (including None) is memoised; call reset_messari_provider() to rebuild.
+    Constructing the provider makes no request (the ranked asset table is pulled on first
+    use or by cloudrun_entry's warm-up). Thread-safe like get_desk_bigquery().
+    """
+    global _messari, _messari_built
+    if _messari_built:
+        return _messari
+    with _messari_lock:
+        if _messari_built:
+            return _messari
+        prov = None
+        try:
+            from providers.messari import MessariProvider
+            from utils.config import Config
+
+            key = Config().MESSARI_API_KEY
+            if not key:
+                logger.warning("No Messari API key (env MESSARI_API_KEY or secret messari_api_key2); "
+                               "news / sector / ETF / Intel tools will be unavailable.")
+            else:
+                prov = MessariProvider(key)
+                logger.info("News + taxonomy + ETF provider: Messari")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Messari provider unavailable: %s", e)
+        _messari = prov
+        _messari_built = True
+        return _messari
+
+
+def reset_messari_provider() -> None:
+    """Drop the memoised MessariProvider so the next get_messari_provider() rebuilds it."""
+    global _messari, _messari_built
+    with _messari_lock:
+        _messari = None
+        _messari_built = False
 
 
 # ----------------------------------------------------------------------

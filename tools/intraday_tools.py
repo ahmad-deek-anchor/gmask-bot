@@ -27,8 +27,7 @@ from langchain_core.tools import tool
 
 from providers import factory as _factory
 from providers.coinmetrics import INTRADAY_FREQUENCIES, MAX_TAPE_MINUTES
-from tools.chat_tools import _fmt_price, _fmt_usd, validate_tokens
-from tools.metrics import FULL_TOKEN_UNIVERSE
+from tools.chat_tools import _fmt_price, _fmt_usd, _unknown_token_message, validate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +49,7 @@ def _spot_provider():
 def _token(token: str) -> tuple[Optional[str], Optional[str]]:
     valid, _, _ = validate_tokens([token])
     if not valid:
-        return None, f"Unknown token '{token}'. Supported symbols: {', '.join(FULL_TOKEN_UNIVERSE)}."
+        return None, _unknown_token_message(token)
     return valid[0], None
 
 

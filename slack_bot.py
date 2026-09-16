@@ -81,7 +81,8 @@ SLACK_PROMPT_PATH = PROMPTS_DIR / "slack_prompt.md"
 DEFAULT_DB = "data/slack_bot.db"
 DEFAULT_SESSIONS = "data/slack_sessions.json"
 SESSION_IDLE_MIN = int(os.getenv("SLACK_SESSION_IDLE_MIN", "120"))  # new conversation after this much silence
-REPLY_IN_THREAD = os.getenv("SLACK_REPLY_IN_THREAD", "0").lower() in ("1", "true", "yes")  # default: answer in the channel
+REPLY_IN_THREAD = os.getenv("SLACK_REPLY_IN_THREAD", "0").lower() in ("1", "true", "yes")  # 1 = answer under the question (Cloud Run)
+TAG_ASKER = os.getenv("SLACK_TAG_ASKER", "1").lower() in ("1", "true", "yes")  # channels: start the reply with <@asker>
 RESET_WORDS = {"reset", "new topic", "new conversation", "start over", "clear", "forget"}
 RESET_TEXT = ":broom: Started a fresh conversation. Earlier context in this channel is forgotten."
 
@@ -102,7 +103,7 @@ EMPTY_TEXT = "_(no response)_"
 
 MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 
-__all__ = ["clean", "to_mrkdwn", "chunk_text", "handle", "answer", "should_handle_dm",
+__all__ = ["clean", "to_mrkdwn", "chunk_text", "handle", "answer", "should_handle_dm", "address",
            "conversation_key", "SessionStore", "is_reset", "build_agent", "build_app", "current_time", "RecordingClient",
            "spawn_episode", "flush_background", "episode_llm",
            "InflightStore", "get_inflight", "warm_memory_store", "sweep_inflight", "shutdown", "loop_lag_watchdog",
@@ -153,6 +154,13 @@ def should_handle_dm(event: dict) -> bool:
     if event.get("bot_id") or event.get("subtype"):
         return False
     return bool(event.get("user"))
+
+
+def address(body: str, user: str, is_dm: bool) -> str:
+    """Prefix a channel reply with the asker's mention (never in DMs, never twice)."""
+    if is_dm or not TAG_ASKER or not user or user == "unknown" or body.startswith(f"<@{user}>"):
+        return body
+    return f"<@{user}> {body}"
 
 
 def is_reset(text: str) -> bool:
@@ -591,7 +599,7 @@ async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, 
     sessions = sessions or get_sessions()
 
     def _reply_kwargs(body: str) -> dict:
-        kwargs = {"channel": channel, "text": body}
+        kwargs = {"channel": channel, "text": address(body, user, is_dm)}
         if event.get("thread_ts") or (event.get("channel_type") != "im" and REPLY_IN_THREAD):
             kwargs["thread_ts"] = event.get("thread_ts") or event["ts"]
         return kwargs
@@ -676,6 +684,7 @@ async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, 
 
         reply = to_mrkdwn(reply) or EMPTY_TEXT
         chunks = chunk_text(reply, CHUNK_CHARS)
+        chunks[0] = address(chunks[0], user, is_dm)   # channels: <@asker> on the first chunk so it lands in their Activity
         await client.chat_update(channel=channel, ts=p_ts, text=chunks[0])
         if p_ts:
             inflight.remove(channel, p_ts)  # the user now sees the answer (or the warning)

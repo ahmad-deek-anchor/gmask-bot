@@ -632,6 +632,14 @@ rows, auth headers, 401 refresh, 403 / 404 / 429 messages, cache TTL, factory) a
 the range cap, the client-flow split: shortcuts, artefacts, missing days, cross-checks) - no
 network, no GCP.
 
+## Threaded answers and the asker mention (Slack)
+
+Since 2026-09-16 the Cloud Run service runs with `SLACK_REPLY_IN_THREAD=1`: a channel answer is
+posted as a reply under the question (follow-ups inside that thread continue the conversation;
+DMs stay flat), and the first chunk of every channel reply starts with `<@asker>` so the answer
+shows up in the asker's Activity list (`SLACK_TAG_ASKER`, default on; DMs never tagged).
+Access-control replies ("not enabled here", command results) follow the same rules.
+
 ## Access control (who may ask the bot what)
 
 Added 2026-09-16 (`access/`). Every Slack message is checked before the agent runs, and every

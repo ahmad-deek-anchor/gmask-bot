@@ -20,3 +20,6 @@ os.environ.setdefault("MESSARI_CACHE_PATH", os.path.join(tempfile.mkdtemp(prefix
 # its own AccessControl (tests/test_access.py), and never touch data/access.db.
 os.environ["ACCESS_CONTROL"] = "off"
 os.environ.setdefault("ACCESS_BACKEND", "memory")
+# Channel replies are prefixed with <@asker> in production (SLACK_TAG_ASKER=1); the existing handle() tests assert
+# exact texts, so keep it off here and test the prefix explicitly in tests/test_slack_bot.py.
+os.environ["SLACK_TAG_ASKER"] = "0"

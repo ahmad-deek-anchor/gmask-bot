@@ -1258,3 +1258,29 @@ def test_selftest_uses_in_memory_inflight(monkeypatch, tmp_path):
     assert asyncio.run(slack_bot.run_selftest("q")) == 0
     assert order == ["agent", "warm"]
     assert not live.exists()
+
+
+# ----------------------------------------------------------------------------
+# <@asker> prefix on channel replies (SLACK_TAG_ASKER)
+# ----------------------------------------------------------------------------
+
+def test_address_prefixes_channel_replies_only(monkeypatch):
+    monkeypatch.setattr(slack_bot, "TAG_ASKER", True)
+    assert slack_bot.address("hello", "U1", is_dm=False) == "<@U1> hello"
+    assert slack_bot.address("hello", "U1", is_dm=True) == "hello"
+    assert slack_bot.address("<@U1> hello", "U1", is_dm=False) == "<@U1> hello"      # never twice
+    assert slack_bot.address("hello", "unknown", is_dm=False) == "hello"
+    monkeypatch.setattr(slack_bot, "TAG_ASKER", False)
+    assert slack_bot.address("hello", "U1", is_dm=False) == "hello"
+
+
+def test_handle_tags_asker_in_channel_first_chunk_only(monkeypatch, _isolated_sessions):
+    monkeypatch.setattr(slack_bot, "TAG_ASKER", True)
+    client, agent = RecordingClient(), FakeAgent("\n".join(f"line {i:03d} " + "x" * 80 for i in range(120)))
+    asyncio.run(handle(_mention(), client, agent, react=False))
+    assert client.updates[0]["text"].startswith("<@U1> line 000")
+    overflow = [p["text"] for p in client.posts if p.get("text") != PLACEHOLDER]
+    assert overflow and not any(t.startswith("<@U1>") for t in overflow)
+    dm_client = RecordingClient()
+    asyncio.run(handle(_mention(channel="D1", channel_type="im"), dm_client, FakeAgent("fine"), react=False))
+    assert dm_client.updates[0]["text"] == "fine"

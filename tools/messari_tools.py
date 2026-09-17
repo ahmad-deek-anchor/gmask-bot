@@ -197,10 +197,10 @@ def get_crypto_news(tokens: List[str] = [], hours: int = 24, limit: int = 15, in
             out.append(f"- {_ts(r['time'])} - **{r['title']}** ({r['source']}){tags}{_sentiment(r['sentiment'])}"
                        + (f" - {r['url']}" if r["url"] else ""))
         notes = [f"_Source: {SOURCE} news feed ({'news, blogs and forums' if include_blogs else 'news outlets only'})."]
-        if df.attrs.get("fallback"):
-            notes.append("Messari's per-asset filter timed out, so the last "
-                         f"{'/'.join(s for s in df.attrs.get('source_types', []))} items were filtered here by asset tag "
-                         "and by ticker / project name in the title - an item that mentions the asset only in its body may be missing.")
+        if df.attrs.get("scanned"):
+            notes.append("Items are matched by Messari's asset tags and by ticker / project name in the headline "
+                         "(most Messari items carry no tags), so a story that mentions the asset only in its body is missed"
+                         + ("; Messari's own per-asset filter timed out for this call." if df.attrs.get("fallback") else "."))
         notes.append("Sentiment is Messari's model score, descriptive only._")
         out.append(" ".join(notes))
         return "\n".join(out)

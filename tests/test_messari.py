@@ -283,18 +283,36 @@ def test_news_asset_filter_falls_back_when_messari_times_out(provider, session):
     assert df2.attrs["unknown"] == ["xyzzy"] and df2["title"].tolist() == ["Helium adds carrier partner"]
 
 
-def test_news_asset_filter_used_when_it_works(tmp_path):
+def test_news_asset_filter_is_combined_with_the_headline_scan(tmp_path):
     prov = MessariProvider("k", session=FakeSession(filtered_news="ok"), cache_path=tmp_path / "m.json")
     df = prov.news(assets=["eth"], hours=24, limit=5)
-    assert df.attrs["fallback"] is False and df["title"].tolist() == ["Ethereum ETF issuers file for staking"]
+    assert df.attrs["fallback"] is False and df.attrs["scanned"] is True
+    assert df["title"].tolist() == ["Ethereum ETF issuers file for staking"]          # tagged item, not duplicated by the scan
+    df = prov.news(assets=["btc"], hours=24, limit=5)
+    # Messari's filter returns the tagged item; the scan adds the untagged headline mention
+    assert df["title"].tolist() == ["Bitcoin slides after Senate cloture vote fails", "BTC options open interest hits record"]
 
 
-def test_news_client_timeout_also_falls_back_and_hard_errors_return_none(tmp_path):
+def test_news_null_data_means_no_rows_not_failure(tmp_path):
+    class Quiet(FakeSession):
+        def get(self, url, params=None, timeout=None):
+            if urlparse(url).path == msr.NEWS_FEED and "assetIds" in (params or {}):
+                return FakeResponse(200, {"data": None, "error": None, "metadata": {"limit": 100, "page": 1, "totalRows": 0, "totalPages": 0}})
+            return super().get(url, params=params, timeout=timeout)
+    prov = MessariProvider("k", session=Quiet(), cache_path=tmp_path / "m.json")
+    data, _ = prov.http.page(msr.NEWS_FEED, {"assetIds": "zcash"})
+    assert data == [] and not prov.http.slow
+    df = prov.news(assets=["hnt"], hours=24, limit=5)                                  # Messari: null; scan finds the headline
+    assert df is not None and df.attrs["fallback"] is False and df["title"].tolist() == ["Helium adds carrier partner"]
+
+
+def test_news_client_timeout_and_hard_errors_still_scan(tmp_path):
     prov = MessariProvider("k", session=FakeSession(filtered_news="timeout"), cache_path=tmp_path / "m.json")
     df = prov.news(assets=["btc"], hours=24, limit=5)
-    assert df is not None and df.attrs["fallback"] is True
+    assert df is not None and df.attrs["fallback"] is True and len(df) == 2
     prov = MessariProvider("k", session=FakeSession(filtered_news="403"), cache_path=tmp_path / "m2.json")
-    assert prov.news(assets=["btc"], hours=24, limit=5) is None
+    df = prov.news(assets=["btc"], hours=24, limit=5)
+    assert df is not None and df.attrs["fallback"] is True and len(df) == 2           # a 403 on the filter no longer kills the answer
 
 
 def test_news_is_memoised_for_five_minutes(provider, session):
@@ -316,7 +334,7 @@ def test_get_crypto_news_tool(tools):
     out = mt.get_crypto_news.invoke({"tokens": ["btc"], "hours": 12, "limit": 5})
     assert out.startswith("### News: BTC, since")
     assert "**Bitcoin slides after Senate cloture vote fails** (CoinDesk) [BIT] - Messari sentiment -0.6 (negative) - https://" in out
-    assert "filtered here by asset tag" in out and "UTC" in out
+    assert "matched by Messari's asset tags" in out and "per-asset filter timed out" in out and "UTC" in out
     market = mt.get_crypto_news.invoke({"limit": 3})
     assert market.startswith("### News: crypto market") and market.count("\n- ") == 3
     assert "Aleo" not in market

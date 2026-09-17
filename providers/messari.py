@@ -5,11 +5,13 @@ Header ``x-messari-api-key``; every response is ``{data, error, metadata}`` and 
 endpoints nest a second ``{data, metadata}`` inside ``data``. Rate limit 200-600 req/min.
 Checked 2026-09-16 on our key:
 
-    /news/v1/news/feed                       ~420 'News'-type items a day, 100 per page.
-                                             Filtering by ``assetIds`` times out (524) on
-                                             Messari's side almost every time, so ``news()``
-                                             fails fast on the filtered call and falls back to
-                                             the unfiltered feed filtered client-side.
+    /news/v1/news/feed                       ~420 'News'-type items a day, 100 per page; 97% of
+                                             items carry no asset tags, and filtering by
+                                             ``assetIds`` times out (524) on Messari's side most
+                                             of the time and returns "data": null for quiet
+                                             assets. ``news()`` therefore fails fast on the
+                                             filtered call and always adds a client-side scan of
+                                             the window matched by tag or headline text.
     /metrics/v2/assets                       47,806 assets, 500 per page, sorted by rank
                                              (rank 0 = unranked); ``search=`` finds by symbol /
                                              name / slug. Carries the taxonomy: ``sectorV2``
@@ -123,6 +125,8 @@ class MessariHTTP(AmberdataHTTP):
         if isinstance(data, dict) and isinstance(data.get("data"), list):
             meta = data.get("metadata") or meta
             data = data["data"]
+        if data is None:
+            data = []        # HTTP 200 with "data": null = no rows (the news feed does this for a quiet asset)
         return data, meta if isinstance(meta, dict) else {}
 
     def pages(self, path: str, params: Optional[dict] = None, max_pages: int = 10,
@@ -560,34 +564,45 @@ class MessariProvider:
                 patterns.append(_title_pattern(str(a).upper(), ""))
 
         fallback = False
-        rows: Optional[list] = None
-        if slugs:
-            data, _ = self.http.page(NEWS_FEED, dict(base, assetIds=",".join(slugs), page=1),
-                                     timeout=NEWS_FILTERED_TIMEOUT_S, retries=0)
-            if data is not None:
-                rows = [r for r in data if isinstance(r, dict)]
-            elif not self.http.slow:
-                return None
-        if rows is None and (slugs or unknown):
-            fallback = True
-            scanned = self.http.pages(NEWS_FEED, base, max_pages=NEWS_MAX_PAGES)
-            if scanned is None:
-                return None
-            want = set(slugs)
-            rows = []
-            for r in scanned:
-                tagged = {a.get("slug") for a in (r.get("assets") or []) if isinstance(a, dict)}
-                if isinstance(r.get("sentiment"), list):
-                    tagged |= {a.get("slug") for a in r["sentiment"] if isinstance(a, dict)}
-                title = r.get("title") or ""
-                if (want & tagged) or any(p.search(title) for p in patterns):
-                    rows.append(r)
-        if rows is None:   # no asset filter: plain feed
+        if not (slugs or unknown):   # no asset filter: plain feed
             rows = self.http.pages(NEWS_FEED, base, max_pages=max(1, math.ceil(limit / NEWS_PAGE)))
             if rows is None:
                 return None
+            df = self._news_frame(rows, None).head(limit)
+            df.attrs.update({"window_start": since, "slugs": [], "fallback": False, "scanned": False, "unknown": unknown,
+                             "source_types": types})
+            return df
+
+        # Asset query. Messari's own filter only sees items it has tagged with the asset, and 97% of
+        # items carry no tags at all (checked 2026-09-16), so the filtered call is combined with a scan
+        # of the unfiltered window matched by tag or by ticker / project name in the headline. The
+        # filtered call also times out on Messari's side most of the time: fail fast, no retry.
+        filtered: list = []
+        if slugs:
+            data, _ = self.http.page(NEWS_FEED, dict(base, assetIds=",".join(slugs), page=1),
+                                     timeout=NEWS_FILTERED_TIMEOUT_S, retries=0)
+            if data is None:
+                fallback = True
+            else:
+                filtered = [r for r in data if isinstance(r, dict)]
+        scanned = self.http.pages(NEWS_FEED, base, max_pages=NEWS_MAX_PAGES)
+        if scanned is None and fallback:
+            return None
+        want = set(slugs)
+        seen = {r.get("url") for r in filtered}
+        rows = list(filtered)
+        for r in scanned or []:
+            if r.get("url") in seen:
+                continue
+            tagged = {a.get("slug") for a in (r.get("assets") or []) if isinstance(a, dict)}
+            if isinstance(r.get("sentiment"), list):
+                tagged |= {a.get("slug") for a in r["sentiment"] if isinstance(a, dict)}
+            title = r.get("title") or ""
+            if (want & tagged) or any(p.search(title) for p in patterns):
+                rows.append(r)
+                seen.add(r.get("url"))
         df = self._news_frame(rows, slugs or None).head(limit)
-        df.attrs.update({"window_start": since, "slugs": slugs, "fallback": fallback, "unknown": unknown,
+        df.attrs.update({"window_start": since, "slugs": slugs, "fallback": fallback, "scanned": True, "unknown": unknown,
                          "source_types": types})
         return df
 

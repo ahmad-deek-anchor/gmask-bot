@@ -85,11 +85,12 @@ def default_tools() -> list:
     from tools.intraday_tools import get_intraday_tools
     from tools.macro_tools import get_macro_tools
     from tools.memory_tools import get_memory_tools
+    from tools.movers_tools import get_movers_tools
     from tools.messari_tools import get_messari_tools
     from tools.sheet_tools import get_sheet_tools
 
-    tools = (get_chat_tools() + get_intraday_tools() + get_messari_tools() + get_cme_tools() + get_macro_tools()
-             + get_desk_tools() + get_sheet_tools() + get_memory_tools())
+    tools = (get_chat_tools() + get_intraday_tools() + get_movers_tools() + get_messari_tools() + get_cme_tools()
+             + get_macro_tools() + get_desk_tools() + get_sheet_tools() + get_memory_tools())
     try:
         from tools.snapshot_tools import get_snapshot_tools
     except ImportError:
@@ -97,6 +98,25 @@ def default_tools() -> list:
     else:
         tools += get_snapshot_tools()
     return tools
+
+
+def with_playbook(block: str, text: str, role: Optional[str] = None) -> str:
+    """Append the matching playbook (prompts/playbooks/*.md) to this turn's context block, if any.
+
+    ``role`` gates playbooks with a ``min_role`` (Slack passes the sender's role; the terminal has none)."""
+    try:
+        import playbooks as _pb
+        pb = _pb.match(text)
+    except Exception as e:  # noqa: BLE001 - a playbook problem must never block an answer
+        logger.warning("playbook lookup failed: %s", e)
+        return block
+    if pb is None:
+        return block
+    if role is not None:
+        from access.policy import role_rank
+        if role_rank(role) < role_rank(pb.min_role):
+            return block
+    return f"{block}\n\n{pb.prompt_block()}" if block else pb.prompt_block()
 
 
 def memory_prompt_middleware(system_prompt: str):
@@ -242,6 +262,7 @@ class ChatSession:
 
         before = self._history_len()
         block = build_context(self.user_id, self.channel_id, text, store=self.memory_store()) if self.recall else ""
+        block = with_playbook(block, text)
         self.last_memory_context = block
         with request_context(self.user_id, self.channel_id, is_dm=False, memory_context=block):
             result = self.agent.invoke({"messages": [HumanMessage(content=text)]}, config=self.config)

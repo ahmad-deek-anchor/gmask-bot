@@ -86,10 +86,11 @@ tool_groups:
     - get_gamma_exposure
   market_heavy:      # slow / expensive: the full written report (~minutes, many API + model calls)
     - run_full_signals_analysis
-  live:              # Coin Metrics live trades, quotes, intraday candles
+  live:              # Coin Metrics live trades, quotes, intraday candles, market-wide movers screen
     - get_live_price
     - get_intraday_candles
     - get_recent_trades
+    - get_top_movers
   news:              # Messari news, taxonomy, Intel, social signals
     - get_crypto_news
     - classify_tokens

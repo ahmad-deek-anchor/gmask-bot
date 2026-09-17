@@ -267,6 +267,9 @@ def test_default_tools_include_desk_tools():
     assert names[:n_chat] == [t.name for t in get_chat_tools()]
     assert names[n_chat:n_chat + n_intra] == intraday
     n_after_intra = n_chat + n_intra
+    from tools.movers_tools import MOVERS_TOOL_NAMES
+    assert names[n_after_intra:n_after_intra + len(MOVERS_TOOL_NAMES)] == MOVERS_TOOL_NAMES
+    n_after_intra += len(MOVERS_TOOL_NAMES)
     assert names[n_after_intra:n_after_intra + len(MESSARI_TOOL_NAMES)] == MESSARI_TOOL_NAMES
     n_after_intra += len(MESSARI_TOOL_NAMES)
     from tools.cme_tools import CME_TOOL_NAMES
@@ -314,9 +317,10 @@ def test_system_prompt_today_injection():
                       "get_crypto_news", "classify_tokens", "get_sector_members", "list_crypto_sectors",
                       "get_cme_curve", "get_cme_open_interest", "get_btc_etf_onchain_flows",
                       "get_etf_overview", "get_etf_flows", "get_intel_events", "get_social_signals",
-                      "get_macro_snapshot", "get_fred_series", "search_fred", "get_treasury_curve", "get_vix_history"):
+                      "get_macro_snapshot", "get_fred_series", "search_fred", "get_treasury_curve", "get_vix_history",
+                      "get_top_movers"):
         assert tool_name in prompt
-    assert "## Macro (FRED)" in prompt
+    assert "## Macro (FRED)" in prompt and "## Playbooks" in prompt
     assert "## News and classification (Messari)" in prompt
     assert "Desk data (BigQuery)" in prompt and "data_quality_flag" in prompt and "brokerage_a1" in prompt
     assert "## Long-term memory" in prompt and "<memories>" in prompt

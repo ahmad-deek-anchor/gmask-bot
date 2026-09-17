@@ -66,7 +66,7 @@ TOKENS_WITHOUT_LIQUIDATIONS = {"fluid", "morpho", "pendle", "pump"}
 # Candle frequencies the market-candles endpoint serves below daily (catalog_market_candles_v2,
 # checked 2026-09-16 for coinbase-btc-usd-spot). "1d" is handled by the daily methods above.
 INTRADAY_FREQUENCIES = ("1m", "5m", "10m", "15m", "30m", "1h", "4h")
-MAX_INTRADAY_LOOKBACK_MIN = 7 * 24 * 60   # one week of bars per call is plenty for a chat answer
+MAX_INTRADAY_LOOKBACK_MIN = 10 * 24 * 60  # ten days of hourly bars: enough for a T-7d comparison with slack
 MAX_TAPE_MINUTES = 60                     # market trades: cap the tape window at an hour
 
 

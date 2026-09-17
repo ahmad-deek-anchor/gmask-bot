@@ -649,6 +649,26 @@ DMs stay flat), and the first chunk of every channel reply starts with `<@asker>
 shows up in the asker's Activity list (`SLACK_TAG_ASKER`, default on; DMs never tagged).
 Access-control replies ("not enabled here", command results) follow the same rules.
 
+## Playbooks and the daily commentary
+
+Added 2026-09-17. A playbook is a markdown recipe in `prompts/playbooks/` (YAML front matter:
+`name`, `description`, `triggers`, `min_role`) that the bot appends to its instructions for one
+turn when a message contains a trigger phrase as whole words, e.g. "generate the daily
+commentary". `playbooks.py` loads them once per process (they ship in the image like every
+prompt; `PLAYBOOKS_DIR` overrides), `chat.with_playbook` injects the matching one next to the
+recalled memories, and Slack gates it on the sender's role (`min_role`). `@GM Bot playbooks`
+lists them. The first playbook, `daily_commentary.md`, prescribes the tool calls (movers screen,
+news, z-scores, CME curve, ETF flows, options snapshot and flow, Treasury curve, VIX, FRED) and a
+six-paragraph template mirroring the desk's morning note; it runs on request only (a scheduled
+post was deferred on 2026-09-17). Not yet in the data: net taker flow by exchange, Coinbase
+premium, order-book skew, constant-maturity CME basis, block-flow direction, index futures.
+
+`get_top_movers(n=100, min_cap_usd=1e9)` (`tools/movers_tools.py`) backs the note: one call pulls
+ten days of hourly candles for every asset in the ranking (thread pool, ~55 s cold for 120 assets,
+memoised 10 minutes) and reports last price, T-24h and T-7d moves, 24h volume and its ratio to the
+7-day average, with the majors, leaders / laggards above the cap floor and small caps on unusual
+volume. Tests: `tests/test_playbooks.py`, `tests/test_movers.py`.
+
 ## Access control (who may ask the bot what)
 
 Added 2026-09-16 (`access/`). Every Slack message is checked before the agent runs, and every

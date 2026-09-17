@@ -67,9 +67,10 @@ from zoneinfo import ZoneInfo
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 
+import playbooks as _playbooks
 from access.commands import is_access_command, run_access_command
 from access.policy import get_access_control
-from chat import RECURSION_LIMIT, build_chat_agent, load_system_prompt, message_text
+from chat import RECURSION_LIMIT, build_chat_agent, load_system_prompt, message_text, with_playbook
 from notifiers.slack import CHUNK_CHARS, chunk_text, to_mrkdwn
 from tools.context import request_context
 from tools.memory_tools import EPISODE_EVERY_N_REPLIES, build_context, count_replies, record_episode
@@ -471,7 +472,7 @@ async def warm_memory_store() -> bool:
 
 
 async def answer(agent, thread_id: str, user_id: str, text: str, channel_id: str | None = None,
-                 is_dm: bool = False, recall: bool = True) -> str:
+                 is_dm: bool = False, recall: bool = True, role: str | None = None) -> str:
     """Run one turn on ``thread_id`` and return the final assistant text.
 
     The Slack identity is published to the memory tools through ``tools.context`` and the
@@ -493,6 +494,7 @@ async def answer(agent, thread_id: str, user_id: str, text: str, channel_id: str
             log.warning("memory recall failed: %s", e)
     if block:
         log.info("recall thread=%s user=%s chars=%d", thread_id, user_id, len(block))
+    block = with_playbook(block, text, role)
     with request_context(user_id, channel_id, is_dm=is_dm, memory_context=block):
         result = await agent.ainvoke(
             {"messages": [HumanMessage(content=f"<@{user_id}>: {text}")]},
@@ -605,8 +607,10 @@ async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, 
         return kwargs
 
     control = get_access_control()
+    role: str | None = None
     if control is not None:
         decision = control.decide(user, channel, is_dm)
+        role = decision.role
         if is_access_command(text):
             reply = run_access_command(event.get("text", ""), decision, control)
             await client.chat_postMessage(**_reply_kwargs(reply))
@@ -623,6 +627,9 @@ async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, 
             log.info("denied place channel=%s user=%s role=%s (%s)", channel, user, decision.role, decision.reason)
             await client.chat_postMessage(**_reply_kwargs(control.policy.message("denied_place")))
             return
+    if _playbooks.is_playbook_command(text):
+        await client.chat_postMessage(**_reply_kwargs(_playbooks.describe(role)))
+        return
 
     if is_reset(text):
         sessions.reset(event)
@@ -667,7 +674,7 @@ async def handle(event: dict, client, agent, *, timeout: float = AGENT_TIMEOUT, 
         ok = False
         try:
             # This deadline only works because answer() awaits nothing blocking (see its comment).
-            reply = await asyncio.wait_for(answer(agent, thread_id, user, text, channel_id=channel, is_dm=is_dm),
+            reply = await asyncio.wait_for(answer(agent, thread_id, user, text, channel_id=channel, is_dm=is_dm, role=role),
                                            timeout=timeout)
             ok = True
         except asyncio.TimeoutError:

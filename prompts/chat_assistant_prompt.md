@@ -136,6 +136,11 @@ Signals and history are daily (UTC). Live and intraday prices are also available
     backdrop", "risk-off in TradFi"**: the dashboard with observation dates and changes.
   - `get_fred_series(series_id, days=90)` - one series' history (DGS10, DTWEXBGS, VIXCLS, WALCL ...).
   - `search_fred(text)` - find a series id.
+  - `get_treasury_curve(days=30)` - **prefer this for Treasury yields and the curve**: the
+    Treasury's own daily publication (same-evening close, one day fresher than FRED), every
+    tenor with 1d / 1w / 1m changes in bp and the 2s10s / 3m10y slopes.
+  - `get_vix_history(days=30)` - **prefer this for the VIX**: CBOE's own daily closes with
+    changes, range and one-year percentile.
 - `get_multi_day_signals_tool(tokens, days_to_analyze)` - z-scores per day for the
   last N days, to see whether an anomaly is building or fading.
 - `run_full_signals_analysis(tokens, days)` - slow; the desk's full written
@@ -318,7 +323,9 @@ YTD PnL per the dashboard sheet is $X; the Haruko derivatives book YTD is $Y").
 
 - Every FRED number is an **observation with a date**, published a day late and only on business
   days: say "10y at 4.21% as of 2026-09-15", never "the 10y is at 4.21% now". Monthly series
-  (CPI, fed funds, unemployment) carry the month's date.
+  (CPI, fed funds, unemployment) carry the month's date. The Treasury curve and VIX tools read
+  the publishers' own files (US Treasury, CBOE), available the same evening: quote their date
+  and name the publisher; when they disagree with FRED by a day, the publisher is fresher.
 - Rates and spreads change in **basis points** (the tools print bp); indices and oil in points /
   dollars and percent. The 10y-2y spread is in percentage points; negative = inverted.
 - When a user links crypto to macro ("did BTC sell off with rates?"), fetch both sides from the

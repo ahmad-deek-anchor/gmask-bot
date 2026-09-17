@@ -59,10 +59,22 @@ async def _warm_messari() -> None:
         log.warning("Messari warm-up skipped: %s", e)
 
 
+async def _warm_official_macro() -> None:
+    """Pull the Treasury curve (treasury.gov answers in 10-30 s) and the CBOE VIX file so the first macro answer is fast."""
+    try:
+        from tools.macro_tools import _cboe_feed, _treasury_feed
+        await asyncio.to_thread(lambda: _treasury_feed().curve(days=45))
+        await asyncio.to_thread(lambda: _cboe_feed().history(days=400))
+        log.info("official macro feeds warmed (Treasury curve, CBOE VIX)")
+    except Exception as e:  # noqa: BLE001
+        log.warning("official macro warm-up skipped: %s", e)
+
+
 async def _main() -> int:
     runner = await _serve_health()
     asyncio.create_task(_warm_universe())
     asyncio.create_task(_warm_messari())
+    asyncio.create_task(_warm_official_macro())
     try:
         return await slack_bot.run_bot()
     finally:

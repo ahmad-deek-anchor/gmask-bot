@@ -296,6 +296,13 @@ SOFR, FEDFUNDS, DTWEXBGS (broad dollar), DCOILWTICO / DCOILBRENTEU, SP500 / NASD
 VIXCLS, BAMLH0A0HYM2 / BAMLC0A0CM (HY / IG OAS), T5YIE / T10YIE, CPIAUCSL, UNRATE. FRED's LBMA gold
 series was discontinued, so gold is not on the dashboard (search_fred finds alternatives).
 
+Two free official feeds that need no key sit beside FRED (`providers/official_macro.py`, added
+2026-09-17): the **US Treasury daily par yield curve** (Treasury's Atom XML, one month per call,
+published the same evening, so a day fresher than FRED's DGS series) and **CBOE's VIX history
+file** (daily OHLC since 1990). Both are memoised 30 minutes. Google Finance and Yahoo have no
+licensed API and Stooq blocks programmatic use; index futures and a live dollar index still
+need a paid vendor (Databento was considered and deferred on 2026-09-17).
+
 Tools (`tools/macro_tools.py`, registered after the CME tools):
 
 | Tool | What it answers |
@@ -303,6 +310,8 @@ Tools (`tools/macro_tools.py`, registered after the CME tools):
 | `get_macro_snapshot(groups="")` | the dashboard by group (rates, fx, commodities, equities, volatility, credit, inflation, labour) with observation date and change vs prior print / 1w / 1m (bp for rates and spreads) |
 | `get_fred_series(series_id, days=90)` | one series' history with title, units, frequency, latest value, window change, high / low |
 | `search_fred(text, limit=10)` | find a series id by keywords, sorted by FRED popularity |
+| `get_treasury_curve(days=30)` | the Treasury's own curve as of the latest close: every tenor with 1d / 1w / 1m changes in bp, 2s10s / 3m10y / 5s30s slopes |
+| `get_vix_history(days=30)` | CBOE's own VIX closes: latest, changes, window range, one-year percentile |
 
 Every value is an observation with a date (one-day publication lag, business days only); the
 prompt tells the model to quote it as such and never as a live quote.

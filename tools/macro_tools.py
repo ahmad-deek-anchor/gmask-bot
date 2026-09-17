@@ -1,8 +1,11 @@
-"""@tool functions over FRED (providers/fred.py): the desk's traditional-finance macro read.
+"""@tool functions over FRED (providers/fred.py) and the free official feeds (providers/official_macro.py):
+the desk's traditional-finance macro read.
 
     get_macro_snapshot(groups)          dashboard: rates, curve, dollar, oil, equity indices, VIX, credit, inflation, labour
     get_fred_series(series_id, days)    one series' recent history with changes
     search_fred(text, limit)            find a FRED series id
+    get_treasury_curve(days)            US Treasury par curve straight from the Treasury (same-day close), with 2s10s / 3m10y
+    get_vix_history(days)               CBOE VIX daily OHLC from CBOE's own file
 
 FRED publishes with a one-day lag and only on business days; every number here is quoted with
 its observation date, never as "now". Equity / ETF tickers, commodity futures curves, FX pairs
@@ -18,6 +21,7 @@ import pandas as pd
 from langchain_core.tools import tool
 
 from providers.fred import GROUPS, MACRO_SERIES, FredError
+from providers.official_macro import TENOR_ORDER, CboeVix, OfficialFeedError, TreasuryCurve
 from tools.desk_tools import _md_table
 
 logger = logging.getLogger(__name__)
@@ -205,11 +209,153 @@ def search_fred(text: str, limit: int = 10) -> str:
     return _guarded("search_fred", body)
 
 
+# ---------------------------------------------------------------------------
+# official feeds (no key): US Treasury curve, CBOE VIX
+# ---------------------------------------------------------------------------
+
+_treasury: Optional[TreasuryCurve] = None
+_cboe: Optional[CboeVix] = None
+
+
+def _treasury_feed() -> TreasuryCurve:
+    """Shared TreasuryCurve (tests monkeypatch this)."""
+    global _treasury
+    if _treasury is None:
+        _treasury = TreasuryCurve()
+    return _treasury
+
+
+def _cboe_feed() -> CboeVix:
+    """Shared CboeVix (tests monkeypatch this)."""
+    global _cboe
+    if _cboe is None:
+        _cboe = CboeVix()
+    return _cboe
+
+
+def _bp(v) -> str:
+    return "n/a" if v is None or pd.isna(v) else f"{float(v) * 100:+.0f} bp"
+
+
+def _yield(v) -> str:
+    return "n/a" if v is None or pd.isna(v) else f"{float(v):.2f}%"
+
+
+def _row_at_or_before(df: pd.DataFrame, when) -> Optional[pd.Series]:
+    prior = df[df["date"] <= when]
+    return prior.iloc[-1] if len(prior) else None
+
+
+@tool("get_treasury_curve")
+def get_treasury_curve(days: int = 30) -> str:
+    """US Treasury par yield curve straight from the Treasury's daily publication (1 month to 30 years, in percent), as of the latest US close: every tenor with the change versus the prior day, one week and one month in basis points, plus the 2s10s and 3m10y slopes. Fresher than FRED (published the same evening).
+
+    Use for "where is the curve", "how much did the 10-year move this week", "is the curve
+    inverted", "front end vs long end". Values are the Treasury's own par yields for the date shown.
+
+    Args:
+        days: History window for the changes and the recent table (default 30, max 3660).
+
+    Returns:
+        Markdown: as-of date, curve table with changes, slopes, and the last few daily closes of 2y / 10y / 30y.
+    """
+    n = max(7, min(int(days), 3660))
+    try:
+        df = _treasury_feed().curve(days=n)
+    except OfficialFeedError as e:
+        return (f"US Treasury feed error: {e}. The Treasury site is slow at times; the same yields one day older are in "
+                "get_macro_snapshot (FRED DGS2 / DGS10 / DGS30).")
+    except Exception as e:  # noqa: BLE001
+        logger.error("get_treasury_curve failed: %s", e)
+        return f"Error reading the Treasury curve: {type(e).__name__}: {e}"
+    if df.empty:
+        return f"The Treasury feed returned no curve rows for the last {n} days."
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else None
+    week = _row_at_or_before(df, last["date"] - pd.Timedelta(days=7))
+    month = _row_at_or_before(df, last["date"] - pd.Timedelta(days=28))
+    out = [f"### US Treasury par yield curve as of {last['date']:%Y-%m-%d} (US Treasury daily publication)"]
+    rows = []
+    for t in TENOR_ORDER:
+        if pd.isna(last.get(t)):
+            continue
+        rows.append([t, _yield(last[t]), _bp(last[t] - prev[t]) if prev is not None else "n/a",
+                     _bp(last[t] - week[t]) if week is not None else "n/a", _bp(last[t] - month[t]) if month is not None else "n/a"])
+    out += _md_table(["Tenor", "Yield", "1d", "1w", "1m"], rows)
+    slopes = []
+    if not pd.isna(last.get("2y")) and not pd.isna(last.get("10y")):
+        s2 = (last["10y"] - last["2y"]) * 100
+        s2_prev = (prev["10y"] - prev["2y"]) * 100 if prev is not None else None
+        slopes.append(f"2s10s {s2:+.0f} bp" + (f" ({s2 - s2_prev:+.0f} bp on the day)" if s2_prev is not None else ""))
+    if not pd.isna(last.get("3m")) and not pd.isna(last.get("10y")):
+        slopes.append(f"3m10y {(last['10y'] - last['3m']) * 100:+.0f} bp")
+    if not pd.isna(last.get("5y")) and not pd.isna(last.get("30y")):
+        slopes.append(f"5s30s {(last['30y'] - last['5y']) * 100:+.0f} bp")
+    if slopes:
+        out.append("- slopes: " + "; ".join(slopes) + (" (negative = inverted)" if any("-" in x.split()[1] for x in slopes) else ""))
+    tail = df.tail(6)
+    out.append("")
+    out += _md_table(["Date", "2y", "10y", "30y"], [[f"{r['date']:%Y-%m-%d}", _yield(r.get("2y")), _yield(r.get("10y")), _yield(r.get("30y"))]
+                                                    for _, r in tail.iterrows()])
+    out.append("_Source: US Department of the Treasury, daily par yield curve (published after the US close; not live). "
+               "Changes are in basis points._")
+    return "\n".join(out)
+
+
+@tool("get_vix_history")
+def get_vix_history(days: int = 30) -> str:
+    """CBOE VIX daily open / high / low / close from CBOE's own history file, as of the latest US close: latest level, change on the day, one week and one month, the window's range, and where the level sits in the trailing one-year distribution.
+
+    Use for "where is the VIX", "is equity vol elevated", "VIX vs a month ago". Daily closes only, not live.
+
+    Args:
+        days: Window in days for the table and changes (default 30, max 14600).
+
+    Returns:
+        Markdown summary plus a table of the last daily closes (up to 45 rows).
+    """
+    n = max(7, min(int(days), 365 * 40))
+    try:
+        df = _cboe_feed().history(days=max(n, 370))
+    except OfficialFeedError as e:
+        return f"CBOE feed error: {e}"
+    except Exception as e:  # noqa: BLE001
+        logger.error("get_vix_history failed: %s", e)
+        return f"Error reading the VIX history: {type(e).__name__}: {e}"
+    if df.empty:
+        return "The CBOE feed returned no VIX rows."
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else None
+    week = _row_at_or_before(df, last["date"] - pd.Timedelta(days=7))
+    month = _row_at_or_before(df, last["date"] - pd.Timedelta(days=28))
+    window = df[df["date"] >= last["date"] - pd.Timedelta(days=n)]
+    year = df[df["date"] >= last["date"] - pd.Timedelta(days=365)]
+    pct = float((year["close"] < last["close"]).mean() * 100) if len(year) else float("nan")
+    out = [f"### VIX as of {last['date']:%Y-%m-%d} close (CBOE)",
+           f"- close {last['close']:.2f} (day range {last['low']:.2f} to {last['high']:.2f})"
+           + (f"; {last['close'] - prev['close']:+.2f} on the day" if prev is not None else "")
+           + (f", {last['close'] - week['close']:+.2f} vs one week ago" if week is not None else "")
+           + (f", {last['close'] - month['close']:+.2f} vs one month ago" if month is not None else ""),
+           f"- last {n} days: high {window['close'].max():.2f} on {window.loc[window['close'].idxmax(), 'date']:%Y-%m-%d}, "
+           f"low {window['close'].min():.2f} on {window.loc[window['close'].idxmin(), 'date']:%Y-%m-%d}, average {window['close'].mean():.2f}",
+           f"- one-year context: the current close is above {pct:.0f}% of the last year's closes "
+           f"(1y range {year['close'].min():.2f} to {year['close'].max():.2f})" if len(year) else "- one-year context unavailable"]
+    shown = window if len(window) <= MAX_ROWS else window.tail(MAX_ROWS)
+    out.append("")
+    out += _md_table(["Date", "Open", "High", "Low", "Close"],
+                     [[f"{r['date']:%Y-%m-%d}", f"{r['open']:.2f}", f"{r['high']:.2f}", f"{r['low']:.2f}", f"{r['close']:.2f}"] for _, r in shown.iterrows()])
+    if len(shown) < len(window):
+        out.append(f"(table shows the last {len(shown)} of {len(window)} days)")
+    out.append("_Source: CBOE VIX history file (daily closes, published after the US close; not live)._")
+    return "\n".join(out)
+
+
 def get_macro_tools() -> list:
-    """FRED macro tools, in registration order."""
-    return [get_macro_snapshot, get_fred_series, search_fred]
+    """FRED + official-feed macro tools, in registration order."""
+    return [get_macro_snapshot, get_fred_series, search_fred, get_treasury_curve, get_vix_history]
 
 
 MACRO_TOOL_NAMES = [t.name for t in get_macro_tools()]
 
-__all__ = ["MACRO_TOOL_NAMES", "NOT_COVERED", "UNAVAILABLE", "get_fred_series", "get_macro_snapshot", "get_macro_tools", "search_fred"]
+__all__ = ["MACRO_TOOL_NAMES", "NOT_COVERED", "UNAVAILABLE", "get_fred_series", "get_macro_snapshot", "get_macro_tools",
+           "get_treasury_curve", "get_vix_history", "search_fred"]

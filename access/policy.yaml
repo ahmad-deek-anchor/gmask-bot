@@ -104,10 +104,12 @@ tool_groups:
   cme:               # Coin Metrics CME futures
     - get_cme_curve
     - get_cme_open_interest
-  macro:             # FRED
+  macro:             # FRED + official feeds (US Treasury curve, CBOE VIX)
     - get_macro_snapshot
     - get_fred_series
     - search_fred
+    - get_treasury_curve
+    - get_vix_history
   snapshots:         # daily snapshot history; the `source` argument decides sensitivity (see argument_rules)
     - get_snapshot_history
     - compare_to_snapshot

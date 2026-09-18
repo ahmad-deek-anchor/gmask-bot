@@ -124,6 +124,7 @@ def test_capture_haruko_rows_and_combined():
     sql = bq.sqls[-1]
     assert "ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY position_timestamp DESC)" in sql
     assert "fct_otc_haruko_pnl_portfolio" in sql and "total_gamma_percent_usd" in sql
+    assert "AND entity_id IN (20, 86, 87)" in sql               # desk scope (providers/desk_scope.py)
 
     a1, adsd, comb = _by_metric(res.rows, "20"), _by_metric(res.rows, "86"), _by_metric(res.rows, "combined")
     expected = set(HARUKO_METRICS) | {"valid_pricer_pct", "data_quality_flag"}
@@ -147,6 +148,15 @@ def test_capture_haruko_rows_and_combined():
 def test_capture_haruko_single_entity_has_no_combined():
     bq = FakeBQ(frames={"fct_otc_haruko_pnl_portfolio": lambda: _snapshot_frame().iloc[:1]})
     res = capture_haruko(bq)
+    assert {r.entity for r in res.rows} == {"20"}
+
+
+def test_capture_haruko_skips_entities_outside_the_desk_scope():
+    def frame():
+        df = _snapshot_frame()
+        df.loc[df.index[-1], "entity_id"] = 999            # some other Haruko account
+        return df
+    res = capture_haruko(FakeBQ(frames={"fct_otc_haruko_pnl_portfolio": frame}))
     assert {r.entity for r in res.rows} == {"20"}
 
 

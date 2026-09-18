@@ -3,10 +3,15 @@
 Scope: the A1 / OTC derivatives desk book as risk-managed in **Haruko** (options,
 futures/perps and spot balances across Deribit, Binance, OKX, Bybit, Kraken and OTC
 counterparties), the OTC derivatives trade blotter, live Talos orders and the
-desk's internal price feed. Two legal entities appear in the Haruko tables:
-``entity_id 20 = A1 Ltd`` and ``entity_id 86 = ADSD (Anchorage Digital Swap
-Dealer)``. Custody / HOLD / CRMS / lending data live in other datasets the agent
-cannot read.
+desk's internal price feed.
+
+**Scope (providers/desk_scope.py).** The derivatives desk is exactly three Haruko
+portfolios - ``Derivs Risk`` (entity 20, A1 Ltd), ``ADSD`` (86, Anchorage Digital Swap
+Dealer) and ``AD Hedge Co`` (87) - and every query here filters to them
+(``entity_id IN (20, 86, 87)`` / ``strategy_name IN (...)``), then appends a scope
+footer. Other Haruko accounts are excluded by default (Ahmad Deek, 2026-09-18). The
+BigQuery export holds entities 20 and 86 only; 87 has no rows yet. Custody / HOLD /
+CRMS / lending data live in other datasets the agent cannot read.
 
 Every tool returns compact markdown (never a raw dump), states the as-of
 timestamp of the snapshot it used and surfaces Haruko's ``data_quality_flag`` /
@@ -18,7 +23,7 @@ Tables used (dataset ``brokerage_a1`` unless noted; verified 2026-09-10):
 * ``fct_otc_haruko_position_pnl_history`` (+ ``fct_otcderivatives_trades``) - the
   position-level snapshot history behind ``get_derivs_pnl_eod``: Carson Levy's EOW
   method run live via ``sql/haruko_eod_pnl.sql`` / ``providers/haruko_eod.py``
-  (3pm America/Chicago EOD cut, LTD differences; ~15 GB per run, cached 15 min).
+  (3pm America/Chicago EOD cut, LTD differences; ~21 GB per run, cached 15 min).
   This is the **authoritative** source for monthly / MTD / YTD derivatives PnL.
 * ``fct_otc_haruko_pnl_portfolio`` - portfolio snapshot every ~5 min, one row per
   entity: position/venue/asset counts, ``total_abs_size_usd`` (gross notional),
@@ -59,6 +64,8 @@ import pandas as pd
 from langchain_core.tools import tool
 
 from providers.bigquery import SQLGuardError, format_bytes
+from providers.desk_scope import (ENTITY_NAMES, ENTITY_PORTFOLIO, entity_ids, entity_name, entity_sql, otc_entity_sql, portfolios,
+                                  scope_label, scope_note, strategy_sql)
 from providers.haruko_eod import METHOD_LINE, HarukoEodError, HarukoEodPnl
 
 logger = logging.getLogger(__name__)
@@ -78,10 +85,8 @@ OPEN_ORDERS = "brokerage_a1.fct_a1_talos_open_orders_live"
 LIVE_PRICES = "pricing.fct_current_asset_prices_live"
 INTRADAY_PRICES = "pricing.intraday_price"
 
-ENTITY_NAMES = {20: "A1 Ltd", 86: "ADSD (Anchorage Digital Swap Dealer)"}
-
 QUERY_DISPLAY_ROWS = 40          # rows shown by query_desk_data
-MAX_HISTORY_DAYS_PORTFOLIO = 90  # 2 entities x 90 = 180 rows < 200 cap
+MAX_HISTORY_DAYS_PORTFOLIO = 200 // max(1, len(entity_ids()))   # entities x days must stay < the 200-row cap (66 for 3)
 MAX_HISTORY_DAYS_GROUPED = 28    # (6 groups + other) x 28 = 196 rows < 200 cap
 MAX_TOP_N = 50
 EOD_LOOKBACK_DAYS = 7            # how far back to look for the latest EOD snapshot
@@ -119,12 +124,14 @@ def _get_haruko_eod(bq) -> HarukoEodPnl:
     return inst
 
 
-def _guarded(name: str, body: Callable) -> str:
+def _guarded(name: str, body: Callable, scoped: bool = False) -> str:
+    """Run ``body(bq)``; ``scoped`` tools (everything reading Haruko / OTC tables) get the portfolio-scope footer."""
     bq = _get_bq()
     if bq is None:
         return UNAVAILABLE
     try:
-        return body(bq)
+        out = body(bq)
+        return f"{out}\n{scope_note()}" if scoped else out
     except SQLGuardError as e:
         return f"Rejected by the read-only guard: {e}"
     except Exception as e:  # noqa: BLE001 - surface to the model, never crash the agent
@@ -201,8 +208,13 @@ def _date(v) -> str:
 
 
 def _entity(eid) -> str:
+    return entity_name(eid)
+
+
+def _portfolio(eid) -> str:
+    """Short portfolio name for table cells ('Derivs Risk', 'ADSD', 'AD Hedge Co')."""
     try:
-        return ENTITY_NAMES.get(int(eid), f"entity {int(eid)}")
+        return ENTITY_PORTFOLIO.get(int(eid), f"entity {int(eid)}")
     except (TypeError, ValueError):
         return f"entity {eid}"
 
@@ -330,6 +342,7 @@ latest AS (
   SELECT entity_id, MAX(as_of_date) AS as_of_date
   FROM {t}
   WHERE as_of_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_days} DAY)
+    AND {entity_sql()}
   GROUP BY entity_id
 ),
 snap AS (
@@ -337,6 +350,7 @@ snap AS (
   FROM {t} p
   JOIN latest l ON l.entity_id = p.entity_id AND l.as_of_date = p.as_of_date
   WHERE p.as_of_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_days} DAY)
+    AND {entity_sql('p.entity_id')}
   GROUP BY 1, 2
 )"""
 
@@ -372,8 +386,8 @@ def get_desk_risk_snapshot() -> str:
     """Latest Haruko portfolio risk snapshot for the OTC/derivatives desk: positions, gross/net notional, equity, PnL (day, WTD, MTD, QTD, YTD, LTD), funding PnL, fees, USD greeks (delta, gamma, vega, theta), risk-level labels, large-change flags and data quality.
 
     Use for "what is our delta / gamma / YTD PnL", "how big is the book", "desk risk
-    snapshot", "is the data quality ok". One section per legal entity (A1 Ltd and
-    ADSD) plus a combined line. Snapshots land every ~5 minutes; the as-of time is
+    snapshot", "is the data quality ok". One section per portfolio in scope (Derivs Risk,
+    ADSD, AD Hedge Co - see providers/desk_scope.py) plus a combined line. Snapshots land every ~5 minutes; the as-of time is
     stated. Covers the Haruko-risk-managed A1/OTC book only (options, futures/perps,
     spot balances) - not custody/HOLD. Greeks are Haruko USD-normalised totals:
     delta_usd = USD-equivalent delta; gamma_percent_usd = delta USD change per 1% spot
@@ -386,6 +400,7 @@ FROM (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY position_timestamp DESC) AS rn
   FROM {bq.table(PORTFOLIO)}
   WHERE position_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 DAY)
+    AND {entity_sql()}
 )
 WHERE rn = 1
 ORDER BY entity_id
@@ -443,7 +458,7 @@ LIMIT 10"""
         lines += ["", _bytes_note(df)]
         return "\n".join(lines)
 
-    return _guarded("get_desk_risk_snapshot", body)
+    return _guarded("get_desk_risk_snapshot", body, scoped=True)
 
 
 @tool("get_desk_pnl_history")
@@ -477,6 +492,7 @@ FROM (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY as_of_date, entity_id ORDER BY as_of_timestamp DESC) AS rn
   FROM {bq.table(PORTFOLIO_EOD)}
   WHERE as_of_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {n} DAY)
+    AND {entity_sql()}
 )
 WHERE rn = 1
 ORDER BY as_of_date, entity_id
@@ -516,6 +532,7 @@ WITH snap AS (
   SELECT as_of_date, entity_id, MAX(as_of_timestamp) AS as_of_timestamp
   FROM {t}
   WHERE as_of_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {n} DAY)
+    AND {entity_sql()}
   GROUP BY 1, 2
 ),
 base AS (
@@ -523,6 +540,7 @@ base AS (
   FROM {t} p
   {_eod_join('p')}
   WHERE p.as_of_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {n} DAY)
+    AND {strategy_sql('p.strategy_name')}
 ),
 top AS (
   SELECT grp FROM base
@@ -546,7 +564,7 @@ LIMIT 200"""
         cols = [c for c in order if c in pivot.columns] + [c for c in pivot.columns if c not in order]
         pivot = pivot[cols]
         lines = [f"### Desk day PnL by {mode} (EOD, last {n} days, {_date(pivot.index.min())} to {_date(pivot.index.max())}, "
-                 f"all entities combined)", "",
+                 f"{scope_label()} combined)", "",
                  f"**Latest EOD ({_date(latest_date)}) by {mode}**", ""]
         has_dq = "n_valid" in latest.columns
 
@@ -571,7 +589,7 @@ LIMIT 200"""
                       "Day PnL = Haruko total_pnl (open + realised) per EOD snapshot.", _bytes_note(df)]
         return "\n".join(lines)
 
-    return _guarded("get_desk_pnl_history", body)
+    return _guarded("get_desk_pnl_history", body, scoped=True)
 
 
 @tool("get_derivs_pnl_eod")
@@ -582,8 +600,9 @@ def get_derivs_pnl_eod(period: str = "mtd", include_daily: bool = False) -> str:
     ``fct_otc_haruko_position_pnl_history`` (one full-book snapshot per day, positions
     de-duplicated), PnL = difference in summed life-to-date PnL between EOD rows.
     Monthly figures therefore never use Haruko's month_to_date column (it resets
-    mid-month; August 2026 shows -$18,923 there vs the true +$2,174,523). Total book,
-    A1 Ltd + ADSD combined. The query scans ~15 GB (~$0.08) and takes ~45 s cold; the
+    mid-month; August 2026 shows -$18,923 there vs the true +$2,174,523). Total of the
+    Derivs Risk + ADSD + AD Hedge Co portfolios combined (positions filtered on
+    strategy_name; no per-portfolio split in this method). The query scans ~21 GB (~$0.13) and takes ~45 s cold; the
     result is cached for 15 min so follow-up periods are instant.
 
     Args:
@@ -654,7 +673,7 @@ def get_derivs_pnl_eod(period: str = "mtd", include_daily: bool = False) -> str:
                          "check the Haruko snapshot job before quoting the figure as current.")
         lines += [f"Data coverage: EOD snapshots from {_date(first_date)} (first row) to {_date(latest['eod_date'])}; "
                   f"periods starting earlier are measured from {_date(first_date)}.",
-                  "Caveats: total book A1 Ltd + ADSD combined (no entity split in this method); Haruko MTD/WTD "
+                  f"Caveats: {scope_label()} portfolios combined (no per-portfolio split in this method); Haruko MTD/WTD "
                   "columns shown for reference only; PnL is Haruko mark-to-market life-to-date differences, not the "
                   "spot desk's booked PnL.",
                   f"{_bytes_note(df)} BigQuery cache hit: {_yes_no(df.attrs.get('cache_hit'))}; "
@@ -662,7 +681,7 @@ def get_derivs_pnl_eod(period: str = "mtd", include_daily: bool = False) -> str:
                      if df.attrs.get("from_cache") else "fresh run (result cached in-process for 15 min).")]
         return "\n".join(lines)
 
-    return _guarded("get_derivs_pnl_eod", body)
+    return _guarded("get_derivs_pnl_eod", body, scoped=True)
 
 
 def _yes_no(v) -> str:
@@ -690,6 +709,7 @@ FROM (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY as_of_date, entity_id ORDER BY as_of_timestamp DESC) AS rn
   FROM {bq.table(GREEKS_EOD)}
   WHERE as_of_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {n} DAY)
+    AND {entity_sql()}
 )
 WHERE rn = 1
 ORDER BY as_of_date, entity_id
@@ -719,7 +739,7 @@ LIMIT 200"""
         lines += ["", "Units: Haruko USD-normalised greeks (vega per vol point, theta per day).", _bytes_note(df)]
         return "\n".join(lines)
 
-    return _guarded("get_desk_greeks_history", body)
+    return _guarded("get_desk_greeks_history", body, scoped=True)
 
 
 def _is_perp(symbol, maturity) -> bool:
@@ -762,6 +782,7 @@ SELECT p.as_of_timestamp, p.entity_id, p.symbol, p.underlying_asset, p.venue, p.
 FROM {t} p
 {_eod_join('p')}
 WHERE p.as_of_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {EOD_LOOKBACK_DAYS} DAY)
+  AND {strategy_sql('p.strategy_name')}
   AND p.instrument_type = 'FUTURES'
   AND (p.position != 0 OR p.size_usd != 0)
 ORDER BY ABS(p.size_usd) DESC
@@ -804,7 +825,7 @@ LIMIT 200""")
             lv = live_by_symbol.get(str(r["symbol"]))
             live_qty = _qty(lv["total_exchange_position"]) if lv is not None else "-"
             tokens.append(desk_symbol_to_token(r["underlying_asset"] or r["symbol"]))
-            rows.append([str(r["symbol"]), str(r["venue"]), _entity(r["entity_id"]).split(" ")[0], kind, side, _qty(r["size_coin"]),
+            rows.append([str(r["symbol"]), str(r["venue"]), _portfolio(r["entity_id"]), kind, side, _qty(r["size_coin"]),
                          _usd(r["size_usd"]), _num(r["avg_px"], 2), _num(r["mark_px"], 2), _usd(r["open_pnl"]),
                          _usd(r["total_pnl"]), _usd(r["funding_pnl"]), _usd(r["life_to_date_funding_pnl"]),
                          _usd(r["delta_usd"]), live_qty, "ok" if bool(r["pricer_valid"]) else "INVALID"])
@@ -817,7 +838,7 @@ LIMIT 200""")
                   _token_hint(tokens), _bytes_note(df)]
         return "\n".join(lines)
 
-    return _guarded("get_perp_positions", body)
+    return _guarded("get_perp_positions", body, scoped=True)
 
 
 @tool("get_desk_positions_by_symbol")
@@ -830,7 +851,7 @@ def get_desk_positions_by_symbol(symbol: Optional[str] = None, top_n: int = 20) 
     'BTC-PERP', 'ETHUSDT' - mapped to the underlying) the breakdown is by instrument
     type and venue plus the live spot position; without it, the top N underlyings by
     gross notional. Source: fct_otc_haruko_pnl_position_history_eod (EOD ~23:55 UTC),
-    all entities combined. Covers the Haruko A1/OTC book only, not custody.
+    Derivs Risk / ADSD / AD Hedge Co combined. Covers the Haruko A1/OTC book only, not custody.
 
     Args:
         symbol: Optional token / desk symbol to focus on (e.g. 'btc', 'BTC-PERPETUAL').
@@ -854,6 +875,7 @@ SELECT {group_cols}, COUNT(*) AS n_positions, SUM(p.size_usd) AS gross_usd, SUM(
 FROM {t} p
 {_eod_join('p')}
 WHERE p.as_of_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {EOD_LOOKBACK_DAYS} DAY)
+  AND {strategy_sql('p.strategy_name')}
   {where_sym}
 GROUP BY {group_cols}
 ORDER BY ABS(gross_usd) DESC
@@ -865,7 +887,7 @@ LIMIT 200"""
         as_of = df["as_of"].max()
 
         if token:
-            lines = [f"### Desk exposure in {token.upper()} (Haruko EOD {_ts(as_of)}, all entities)"]
+            lines = [f"### Desk exposure in {token.upper()} (Haruko EOD {_ts(as_of)}, {scope_label()})"]
             tot = df.sum(numeric_only=True)
             lines.append(f"- total: {int(tot['n_positions']):,} positions, gross notional {_usd(tot['gross_usd'])}, net delta "
                          f"{_usd(tot['delta_usd'])} ({_sign_side(tot['delta_usd'])}), gamma {_usd(tot['gamma_usd'])}, vega "
@@ -903,7 +925,7 @@ LIMIT 20""")
             ytd_pnl=("ytd_pnl", "sum"), n_valid=("n_valid", "sum"))
         agg = agg.reindex(agg["gross_usd"].abs().sort_values(ascending=False).index).head(n)
         mix = df.pivot_table(index="underlying_asset", columns="instrument_type", values="n_positions", aggfunc="sum").fillna(0)
-        lines = [f"### Desk exposure by underlying (Haruko EOD {_ts(as_of)}, all entities; top {len(agg)} of "
+        lines = [f"### Desk exposure by underlying (Haruko EOD {_ts(as_of)}, {scope_label()}; top {len(agg)} of "
                  f"{df['underlying_asset'].nunique()} underlyings by gross notional)", ""]
         rows = []
         tokens = []
@@ -923,7 +945,7 @@ LIMIT 20""")
                   _token_hint([t for t in tokens if t and t not in ("usd", "usdc", "usdt", "usdg", "pyusd", "usdtb")]), _bytes_note(df)]
         return "\n".join(lines)
 
-    return _guarded("get_desk_positions_by_symbol", body)
+    return _guarded("get_desk_positions_by_symbol", body, scoped=True)
 
 
 @tool("get_otc_derivatives_trades")
@@ -955,6 +977,7 @@ LEFT JOIN {bq.table(OTC_ASSETS)} qa ON qa.id = p.quote_id
 LEFT JOIN {bq.table(OTC_ACCOUNTS)} a ON a.id = t.account_id
 LEFT JOIN {bq.table(OTC_ENTITIES)} e ON e.id = t.entity_id
 WHERE t.exec_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)
+  AND {otc_entity_sql('t.entity_id')}
 ORDER BY t.exec_time DESC
 LIMIT {n}"""
         df = bq.query(sql)
@@ -965,6 +988,7 @@ FROM {bq.table(OTC_TRADES)} t
 LEFT JOIN {bq.table(OTC_PRODUCTS)} p ON p.id = t.product_id
 LEFT JOIN {bq.table(OTC_ASSETS)} ba ON ba.id = p.base_id
 WHERE t.exec_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)
+  AND {otc_entity_sql('t.entity_id')}
 GROUP BY 1, 2, 3
 ORDER BY n_trades DESC
 LIMIT 100""")
@@ -994,7 +1018,7 @@ LIMIT 100""")
                       "underlying coin). Side is the desk's side.", _bytes_note(df)]
         return "\n".join(lines)
 
-    return _guarded("get_otc_derivatives_trades", body)
+    return _guarded("get_otc_derivatives_trades", body, scoped=True)
 
 
 @tool("get_open_orders")
@@ -1197,7 +1221,10 @@ def query_desk_data(sql: str) -> str:
     on their partition column (as_of_date, position_timestamp, price_timestamp_minute).
     Use list_desk_tables / describe_desk_table first to get exact column names.
     Timestamps are UTC. Never use this to read anything outside the two datasets - it
-    will be refused.
+    will be refused. Desk scope: any query on a Haruko / OTC table (`fct_otc_haruko_*`,
+    `fct_otcderivatives_*`) must filter to the desk's portfolios - `entity_id IN (20, 86, 87)`
+    or `strategy_name IN ('Derivs Risk', 'ADSD', 'AD Hedge Co')` - the result warns when it
+    does not.
 
     Args:
         sql: Standard (GoogleSQL) SELECT statement.
@@ -1214,9 +1241,21 @@ def query_desk_data(sql: str) -> str:
                  + (f" (row cap {bq.max_rows} reached - add filters/aggregation for more)" if len(df) >= bq.max_rows else ""), ""]
         lines += _md_table(headers, rows)
         lines += ["", _bytes_note(df)]
+        if _unscoped_desk_sql(safe):
+            lines.append(f"WARNING: this query reads a Haruko / OTC table without a portfolio filter. Desk answers must be "
+                         f"limited to {scope_label()}: add `{entity_sql()}` or `{strategy_sql()}` and re-run.")
         return "\n".join(lines)
 
     return _guarded("query_desk_data", body)
+
+
+_SCOPED_TABLE_RE = re.compile(r"fct_otc_haruko|fct_otcderivatives|fct_perps", re.IGNORECASE)
+_SCOPE_FILTER_RE = re.compile(r"\b(entity_id|strategy_name)\b", re.IGNORECASE)
+
+
+def _unscoped_desk_sql(sql: str) -> bool:
+    """True when a free-form query touches a Haruko / OTC table and never mentions entity_id / strategy_name."""
+    return bool(_SCOPED_TABLE_RE.search(sql)) and not _SCOPE_FILTER_RE.search(sql)
 
 
 def get_desk_tools() -> list:

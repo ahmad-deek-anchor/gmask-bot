@@ -153,7 +153,7 @@ def test_guard_accepts_carsons_script_and_keeps_limit():
     sql = he.SQL_PATH.read_text()
     safe = validate_declare_script(sql, PROJECT, ALLOWED, 1000)
     assert safe.startswith("DECLARE eod_time TIME DEFAULT TIME '15:00:00';")
-    assert safe.count("DECLARE") == 4
+    assert safe.count("DECLARE") == 5
     assert "fct_otc_haruko_position_pnl_history" in safe and safe.rstrip().endswith("LIMIT 1000")
     assert "-- Haruko end-of-day" not in safe  # header comment dropped, body intact
 
@@ -225,11 +225,17 @@ def test_substitute_declares_valid(h):
     assert "DEFAULT 'Europe/London';" in sql and "DEFAULT DATE '2026-01-31';" in sql and "DEFAULT 300;" in sql
     assert validate_declare_script(sql, PROJECT, ALLOWED, 1000)  # still passes the guard
     assert h.sql() == he.SQL_PATH.read_text()                   # no overrides -> verbatim
+    assert "DECLARE desk_strategies STRING DEFAULT 'Derivs Risk|ADSD|AD Hedge Co';" in sql
+    assert "WHERE h.strategy_name IN UNNEST(SPLIT(desk_strategies, '|'))" in sql
+    narrowed = h.sql(strategies=("Derivs Risk", "ADSD"))
+    assert "DECLARE desk_strategies STRING DEFAULT 'Derivs Risk|ADSD';" in narrowed
+    assert validate_declare_script(narrowed, PROJECT, ALLOWED, 1000)
 
 
 @pytest.mark.parametrize("kw", [
     dict(eod_time="25:00:00"), dict(eod_time="3pm"), dict(eod_zone="Mars/Base"), dict(eod_zone="America/Chicago'; DROP TABLE x; --"),
     dict(base_date="2026-13-01"), dict(base_date="yesterday"), dict(skew=-1), dict(skew=99999), dict(skew="x"), dict(foo=1),
+    dict(strategies=""), dict(strategies="Derivs'; DROP TABLE x; --"), dict(strategies=["ok", "bad;name"]),
 ])
 def test_substitute_declares_rejects_bad_values(kw):
     with pytest.raises(HarukoEodError):
@@ -353,7 +359,8 @@ def test_tool_august(tool):
     assert "Carson Levy EOW method: 3pm America/Chicago EOD cut, LTD differences, one full-book snapshot/day" in out
     assert "$10,872,692 at 2026-07-31 EOD -> $13,047,215 at 2026-08-31 EOD" in out
     assert "MTD -$18,923" in out and "reference only" in out
-    assert "A1 Ltd + ADSD combined" in out and "Bytes scanned: 14.25 GB" in out and "BigQuery cache hit: no" in out
+    assert "Derivs Risk, ADSD and AD Hedge Co portfolios combined" in out and "Bytes scanned: 14.25 GB" in out
+    assert "BigQuery cache hit: no" in out and "_Scope: Derivs Risk, ADSD and AD Hedge Co portfolios only" in out
     assert "fresh run" in out and "WARNING" not in out
     assert "from 2026-06-28 (first row) to 2026-09-10" in out
     assert "| EOD date |" not in out          # no daily table unless asked

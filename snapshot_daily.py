@@ -93,7 +93,8 @@ HARUKO_METRICS = {
 HARUKO_SUMMED = tuple(HARUKO_METRICS)              # combined = sum over entities
 HARUKO_EXTRA_COLS = ("position_timestamp", "entity_id", "valid_pricer_pct", "valid_pricer_count",
                      "invalid_pricer_count", "data_quality_flag")
-HARUKO_ENTITIES = {20: "20", 86: "86"}             # entity_id -> snapshot entity key
+# entity_id -> snapshot entity key; rows for entities outside providers.desk_scope are skipped
+HARUKO_ENTITIES = {eid: str(eid) for eid in __import__("providers.desk_scope", fromlist=["entity_ids"]).entity_ids()}
 COMBINED = "combined"
 NORMAL_FLAG = "normal"
 
@@ -173,6 +174,7 @@ def parse_date(s: Optional[str]) -> date:
 def latest_portfolio_sql(bq, columns: Sequence[str]) -> str:
     """Latest fct_otc_haruko_pnl_portfolio row per entity (last 3 days) - the query
     shape used by tools.desk_tools.get_desk_risk_snapshot, restricted to `columns`."""
+    from providers.desk_scope import entity_sql
     from tools.desk_tools import PORTFOLIO
     return f"""
 SELECT {", ".join(columns)}
@@ -180,6 +182,7 @@ FROM (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY position_timestamp DESC) AS rn
   FROM {bq.table(PORTFOLIO)}
   WHERE position_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 DAY)
+    AND {entity_sql()}
 )
 WHERE rn = 1
 ORDER BY entity_id
@@ -212,7 +215,9 @@ def capture_haruko(bq=None) -> SourceResult:
             eid = int(r["entity_id"])
         except (TypeError, ValueError):
             continue
-        entity = HARUKO_ENTITIES.get(eid, str(eid))
+        entity = HARUKO_ENTITIES.get(eid)
+        if entity is None:                       # not a desk portfolio (see providers/desk_scope.py)
+            continue
         as_of = _iso(r.get("position_timestamp"))
         as_ofs.append(as_of or "")
         for metric, col in HARUKO_METRICS.items():

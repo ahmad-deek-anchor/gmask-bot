@@ -11,8 +11,8 @@ chat agent needs before it is allowed to run SQL written by an LLM:
   The caller has table-data access on exactly those datasets; everything else
   in the project is denied and referencing it would only produce a 403.
 * **Row cap.** A trailing ``LIMIT`` is appended or lowered to ``max_rows``.
-* **Cost cap.** ``maximum_bytes_billed`` is set on every job (default 20 GB; the
-  largest sanctioned query, Carson Levy's EOW derivatives PnL script, scans ~15 GB)
+* **Cost cap.** ``maximum_bytes_billed`` is set on every job (default 30 GB; the
+  largest sanctioned query, Carson Levy's EOW derivatives PnL script, scans ~21 GB)
   and a ``dry_run()`` is available to estimate before running.
 * **DECLARE scripts (narrow allowance, not for LLM SQL).** ``query_script`` /
   ``validate_declare_script`` accept a script made of ``DECLARE name TYPE DEFAULT
@@ -312,7 +312,7 @@ class DeskBigQuery:
         data_project: str = "anc-global-markets",
         billing_project: str = "anchorage-corp-eng-playground",
         allowed_datasets: Iterable[str] = ("brokerage_a1", "pricing"),
-        max_bytes_billed: int = 20_000_000_000,
+        max_bytes_billed: int = 30_000_000_000,
         max_rows: int = 200,
         timeout_s: int = 60,
         catalog_path: str | Path = "data/bq_catalog.json",

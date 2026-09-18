@@ -17,7 +17,7 @@ Haruko's own ``month_to_date_pnl`` / ``week_to_date_pnl`` columns are carried fo
 reference only: they reset mid-period (August 2026 shows -$18,923 while the LTD
 difference is +$2,174,523, which is what the EOW report shows).
 
-The query scans ~15 GB (~$0.08, ~45 s). BigQuery's query cache (24 h, free for an
+The query scans ~21 GB (~$0.13, ~45 s). BigQuery's query cache (24 h, free for an
 identical script) is left on and the result frame is cached in-process for
 ``ttl_s`` (15 min) so follow-ups (MTD, then YTD) do not re-scan.
 """
@@ -53,6 +53,7 @@ _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d):([0-5]\d)$")
 _ZONE_RE = re.compile(r"^[A-Za-z_]+(?:/[A-Za-z0-9_+\-]+){0,2}$")
 _MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
 _RANGE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$")
+_STRATEGY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _./&-]{0,63}$")     # no quotes, ; or | inside a name
 
 
 class HarukoEodError(ValueError):
@@ -100,18 +101,31 @@ def _lit_skew(v: Any) -> str:
     return str(n)
 
 
+def _lit_strategies(v: Any) -> str:
+    """'|'-joined Haruko strategy names (or a list/tuple of them) -> STRING literal for desk_strategies."""
+    parts = list(v) if isinstance(v, (list, tuple)) else str(v).split("|")
+    parts = [str(x).strip() for x in parts if str(x).strip()]
+    if not parts:
+        raise HarukoEodError("strategies must name at least one Haruko portfolio")
+    bad = [x for x in parts if not _STRATEGY_RE.match(x)]
+    if bad:
+        raise HarukoEodError(f"invalid strategy name(s): {bad!r}")
+    return "'" + "|".join(parts) + "'"
+
+
 OVERRIDES = {
     "eod_time": ("eod_time", _lit_time),
     "eod_zone": ("eod_zone", _lit_zone),
     "base_date": ("ytd_base_date", _lit_date),
     "skew": ("max_skew_secs", _lit_skew),
+    "strategies": ("desk_strategies", _lit_strategies),
 }
 
 
 def substitute_declares(sql: str, **overrides: Any) -> str:
     """Replace the DEFAULT literal of the named DECLAREs after validating each value.
 
-    Only the four known parameters are accepted; the new literal is produced by a
+    Only the five known parameters are accepted; the new literal is produced by a
     validator (never raw user text) so the guard's 'plain literal' rule keeps holding.
     """
     out = sql
@@ -190,6 +204,9 @@ class HarukoEodPnl:
         ``df.attrs``: ``bytes_processed``, ``cache_hit`` (BigQuery cache), ``fetched_at``,
         ``from_cache`` (served from the in-process TTL cache), ``sql``.
         """
+        if overrides.get("strategies") is None:
+            from providers.desk_scope import portfolios          # desk scope applies unless a caller narrows it
+            overrides["strategies"] = portfolios()
         key = tuple(sorted((k, str(v)) for k, v in overrides.items() if v is not None))
         with self._lock:
             hit = self._cache.get(key)

@@ -3,11 +3,14 @@
 -- Authors of the method and query: Carson Levy (Global Markets) with Nayshil Dalal.
 -- Copied verbatim (apart from this header) into the bot on 2026-09-11 so that the
 -- bot's Haruko PnL matches the EOW report; run live by providers/haruko_eod.py via
--- DeskBigQuery.query_script (read-only guard, dataset allow-list, 20 GB cost cap).
+-- DeskBigQuery.query_script (read-only guard, dataset allow-list, 30 GB cost cap).
 --
 -- Method:
 --   * Source: anc-global-markets.brokerage_a1.fct_otc_haruko_position_pnl_history
---     (position-level Haruko snapshots, both entities A1 Ltd + ADSD, no entity split).
+--     (position-level Haruko snapshots). Positions are restricted to the desk's portfolios
+--     (desk_strategies, '|'-separated strategy_name values: Derivs Risk, ADSD, AD Hedge Co -
+--     added to Carson's query on 2026-09-18 per Ahmad Deek; see providers/desk_scope.py),
+--     combined, no per-portfolio split.
 --   * Uniform EOD cut at eod_time in eod_zone (15:00 America/Chicago). Only full-book
 --     snapshots (> 100 position rows) qualify; per day the one snapshot nearest 15:00 CT
 --     within max_skew_secs (600 s) is chosen.
@@ -19,7 +22,7 @@
 --     week_to_date_pnl columns are summed for reference only (they reset mid-period).
 --   * Trades (fct_otcderivatives_trades, excluding CANCELED/VOIDED/STAGED and novation
 --     backs) are bucketed to the same EOD date (exec_time + 9h in eod_zone) for notional.
---   * Scans ~15 GB (about $0.08, ~45 s); one row per EOD date, newest first.
+--   * Scans ~21 GB (about $0.13, ~45 s; the strategy_name column adds ~6 GB); one row per EOD date, newest first.
 --
 -- The DECLARE defaults are the only parameters; providers/haruko_eod.py substitutes them
 -- by literal replacement after validation (never by string formatting of user input).
@@ -27,6 +30,7 @@ DECLARE eod_time     TIME    DEFAULT TIME '15:00:00';
 DECLARE eod_zone     STRING  DEFAULT 'America/Chicago';
 DECLARE ytd_base_date DATE    DEFAULT DATE '2025-12-31';
 DECLARE max_skew_secs INT64   DEFAULT 600;
+DECLARE desk_strategies STRING DEFAULT 'Derivs Risk|ADSD|AD Hedge Co';
 WITH snapshots AS (
   SELECT snapshot_timestamp AS ts
   FROM `anc-global-markets.brokerage_a1.fct_otc_haruko_position_pnl_history`
@@ -43,7 +47,8 @@ chosen AS (
 deduped_positions AS (
   SELECT c.eod_date, c.skew_secs, h.life_to_date_pnl, h.year_to_date_pnl, h.month_to_date_pnl, h.week_to_date_pnl,
     ROW_NUMBER() OVER (PARTITION BY c.eod_date, h.key ORDER BY h.is_eod_snapshot DESC) AS rk
-  FROM chosen c JOIN `anc-global-markets.brokerage_a1.fct_otc_haruko_position_pnl_history` h ON h.snapshot_timestamp = c.ts),
+  FROM chosen c JOIN `anc-global-markets.brokerage_a1.fct_otc_haruko_position_pnl_history` h ON h.snapshot_timestamp = c.ts
+  WHERE h.strategy_name IN UNNEST(SPLIT(desk_strategies, '|'))),
 pnl_daily AS (
   SELECT eod_date, ANY_VALUE(skew_secs) AS skew_secs, COUNT(*) AS n_positions,
     SUM(life_to_date_pnl) AS ltd_pnl, SUM(year_to_date_pnl) AS ytd_pnl, SUM(month_to_date_pnl) AS mtd_pnl, SUM(week_to_date_pnl) AS wtd_pnl

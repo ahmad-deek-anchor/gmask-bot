@@ -25,11 +25,15 @@ Desk data in BigQuery (providers/bigquery.py, read-only):
 BQ_DATA_PROJECT       env BQ_DATA_PROJECT      (default anc-global-markets; where the tables live)
 BQ_BILLING_PROJECT    env BQ_BILLING_PROJECT   (default anchorage-corp-eng-playground; jobs run and are billed here)
 BQ_ALLOWED_DATASETS   env BQ_ALLOWED_DATASETS  (default "brokerage_a1,pricing"; comma separated)
-BQ_MAX_BYTES_BILLED   env BQ_MAX_BYTES_BILLED  (default 20_000_000_000 = 20 GB per query; Carson Levy's
-                                               EOW derivatives PnL script scans ~15 GB, 20 GB is ~$0.13 worst case)
+BQ_MAX_BYTES_BILLED   env BQ_MAX_BYTES_BILLED  (default 30_000_000_000 = 30 GB per query; Carson Levy's EOW
+                                               derivatives PnL script scans ~21 GB with the portfolio filter,
+                                               30 GB is ~$0.19 worst case)
 BQ_MAX_ROWS           env BQ_MAX_ROWS          (default 200; LIMIT enforced on every query)
 BQ_TIMEOUT_S          env BQ_TIMEOUT_S         (default 60)
 BQ_CATALOG_PATH       env BQ_CATALOG_PATH      (default data/bq_catalog.json; 24 h table-metadata cache)
+DESK_PORTFOLIOS       env DESK_PORTFOLIOS      (default "Derivs Risk,ADSD,AD Hedge Co"; the Haruko portfolios every desk
+                                               tool filters to - providers/desk_scope.py)
+DESK_ENTITY_IDS       env DESK_ENTITY_IDS      (default "20,86,87"; the matching BigQuery entity_id values)
 
 Long-term memory + daily snapshots (providers/memory_store.py):
 MEMORY_DB_URL         env MEMORY_DB_URL        (default sqlite:///data/memory.db; postgresql://... needs psycopg)
@@ -77,7 +81,7 @@ DEFAULT_VERTEX_MODEL = "claude-sonnet-4-6"
 DEFAULT_BQ_DATA_PROJECT = "anc-global-markets"
 DEFAULT_BQ_BILLING_PROJECT = "anchorage-corp-eng-playground"
 DEFAULT_BQ_ALLOWED_DATASETS = "brokerage_a1,pricing"
-DEFAULT_BQ_MAX_BYTES_BILLED = 20_000_000_000  # ~$0.13 worst case; Carson's EOW PnL script ~15 GB
+DEFAULT_BQ_MAX_BYTES_BILLED = 30_000_000_000  # ~$0.19 worst case; Carson's EOW PnL script ~21 GB (2026-09-18, with strategy filter)
 DEFAULT_BQ_MAX_ROWS = 200
 DEFAULT_BQ_TIMEOUT_S = 60
 DEFAULT_BQ_CATALOG_PATH = "data/bq_catalog.json"

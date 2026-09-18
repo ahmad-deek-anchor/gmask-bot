@@ -333,7 +333,10 @@ def test_risk_snapshot_formatting(fake):
     bq = fake(frames={"fct_otc_haruko_pnl_portfolio": _snapshot_frame})
     out = get_desk_risk_snapshot.invoke({})
     assert out.startswith("### Desk risk snapshot")
-    assert "**A1 Ltd** - as of 2026-09-10 19:33 UTC" in out
+    assert "**Derivs Risk (A1 Ltd)** - as of 2026-09-10 19:33 UTC" in out
+    assert "AND entity_id IN (20, 86, 87)" in bq.sqls[0]
+    assert out.rstrip().endswith("has no rows in the BigQuery export yet, so figures cover the other portfolios._")
+    assert "_Scope: Derivs Risk, ADSD and AD Hedge Co portfolios only (Haruko entities 20, 86, 87)" in out
     assert "**ADSD (Anchorage Digital Swap Dealer)**" in out
     assert "gross $13,900,000,000" in out and "equity -$29,600,000" in out
     assert "day -$430,869" in out and "YTD -$32,500,000" in out and "LTD -$29,695,686" in out
@@ -367,7 +370,8 @@ def test_pnl_history_portfolio(fake):
     bq = fake(frames={"fct_otc_haruko_pnl_portfolio_history_eod": lambda: _portfolio_eod_frame(3)})
     out = get_desk_pnl_history.invoke({"days": 10, "by": "portfolio"})
     assert out.startswith("### Desk PnL history, portfolio level (EOD, last 10 days, 2026-09-08 to 2026-09-10)")
-    assert "**A1 Ltd** (3 days; latest EOD 2026-09-10 23:55 UTC)" in out
+    assert "**Derivs Risk (A1 Ltd)** (3 days; latest EOD 2026-09-10 23:55 UTC)" in out
+    assert "AND entity_id IN (20, 86, 87)" in bq.sqls[0]
     assert "sum of day PnL -$6,000" in out          # -1000 -2000 -3000
     assert "sum of day PnL $6,000" in out           # ADSD
     assert "LTD PnL change $2,000 ($1,000,000 -> $1,002,000)" in out
@@ -379,7 +383,7 @@ def test_pnl_history_portfolio(fake):
 def test_pnl_history_clamps_days_and_rejects_bad_mode(fake):
     bq = fake(frames={"fct_otc_haruko_pnl_portfolio_history_eod": lambda: _portfolio_eod_frame(2)})
     get_desk_pnl_history.invoke({"days": 5000, "by": "portfolio"})
-    assert "INTERVAL 90 DAY" in bq.sqls[-1]
+    assert "INTERVAL 66 DAY" in bq.sqls[-1]          # 3 entities x 66 days < 200-row cap
     get_desk_pnl_history.invoke({"days": 1, "by": "portfolio"})
     assert "INTERVAL 7 DAY" in bq.sqls[-1]
     assert "Unknown breakdown" in get_desk_pnl_history.invoke({"days": 7, "by": "desk"})
@@ -390,6 +394,9 @@ def test_pnl_history_by_venue_pivot(fake):
     out = get_desk_pnl_history.invoke({"days": 60, "by": "venue"})
     assert out.startswith("### Desk day PnL by venue (EOD, last 28 days, 2026-09-08 to 2026-09-09")
     assert "INTERVAL 28 DAY" in bq.sqls[0] and "COALESCE(p.venue, 'unknown')" in bq.sqls[0]
+    assert "AND entity_id IN (20, 86, 87)" in bq.sqls[0]
+    assert "AND p.strategy_name IN ('Derivs Risk', 'ADSD', 'AD Hedge Co')" in bq.sqls[0]
+    assert "Derivs Risk, ADSD and AD Hedge Co combined)" in out and "_Scope:" in out
     # groups ordered by latest gross notional: OTC, DERIBIT, other
     assert "| date | OTC | DERIBIT | other | total |" in out
     assert "| 2026-09-09 | -$476,258 | -$923,442 | $239,644 | -$1,160,056 |" in out
@@ -415,7 +422,8 @@ def test_greeks_history(fake):
     bq = fake(frames={"fct_otc_haruko_greeks_history_eod": _greeks_frame})
     out = get_desk_greeks_history.invoke({"days": 7})
     assert out.startswith("### Desk greeks history (EOD, last 7 days, 2026-09-08 to 2026-09-10)")
-    assert "**A1 Ltd** (3 days; latest EOD 2026-09-10 23:56 UTC; 2,489 positions, gross notional $14,049,180,556)" in out
+    assert "**Derivs Risk (A1 Ltd)** (3 days; latest EOD 2026-09-10 23:56 UTC; 2,489 positions, gross notional $14,049,180,556)" in out
+    assert "AND entity_id IN (20, 86, 87)" in bq.sqls[0]
     assert "change over period: delta -$2,000,000, gamma $0, vega $0, theta $0" in out
     assert "| 2026-09-10 | -$54,000,000 | -$10,000,000 | $6,750,003 | $5,926,975 | $165,302 | -$468,442 | Normal |" in out
     assert "Data quality: Normal; valid pricers 100.0%" in out and "CAVEAT" not in out
@@ -436,11 +444,13 @@ def test_perp_positions(fake):
     assert "gross notional $127,291,928" in out and "LTD funding -$13,271" in out
     assert "invalid pricers on 1 of 4 rows" in out
     assert "live exchange positions as of 2026-09-10 19:40 UTC" in out
-    assert "| BTC-PERPETUAL | DERIBIT | A1 | perp | long | 1,039.16 | $81,315,600 | 78,214.95 | 78,251.55 | $38,050 | $37,952 | $0 | -$274,785 | $81,315,600 | 77,609,600 | ok |" in out
-    assert "| BTCUSDT | BINANCE_EXCHANGE | A1 | perp | short | 401.066 | $31,384,036 |" in out and "| -393.036 | ok |" in out
-    assert "| BTC-25SEP26 | DERIBIT | A1 | fut 2026-09-25 | long |" in out and "| - | INVALID |" in out
+    assert "| BTC-PERPETUAL | DERIBIT | Derivs Risk | perp | long | 1,039.16 | $81,315,600 | 78,214.95 | 78,251.55 | $38,050 | $37,952 | $0 | -$274,785 | $81,315,600 | 77,609,600 | ok |" in out
+    assert "| BTCUSDT | BINANCE_EXCHANGE | Derivs Risk | perp | short | 401.066 | $31,384,036 |" in out and "| -393.036 | ok |" in out
+    assert "| BTC-25SEP26 | DERIBIT | Derivs Risk | fut 2026-09-25 | long |" in out and "| - | INVALID |" in out
     assert "Token mapping - in the market-data universe" in out and "btc, hype" in out
     assert "instrument_type = 'FUTURES'" in bq.sqls[0] and "LIMIT 10" in bq.sqls[0]
+    assert bq.sqls[0].count("entity_id IN (20, 86, 87)") == 2          # latest + snap CTEs
+    assert "AND p.strategy_name IN ('Derivs Risk', 'ADSD', 'AD Hedge Co')" in bq.sqls[0] and "_Scope:" in out
     assert "position_type = 'futures'" in bq.sqls[1]
 
 
@@ -459,7 +469,9 @@ def test_perp_positions_live_overlay_optional_and_empty(fake):
 def test_positions_by_underlying(fake):
     bq = fake(frames={"fct_otc_haruko_pnl_position_history_eod": _by_underlying_frame})
     out = get_desk_positions_by_symbol.invoke({"top_n": 3})
-    assert out.startswith("### Desk exposure by underlying (Haruko EOD 2026-09-09 23:58 UTC, all entities; top 3 of 4 underlyings")
+    assert out.startswith("### Desk exposure by underlying (Haruko EOD 2026-09-09 23:58 UTC, Derivs Risk, ADSD and AD Hedge Co; "
+                          "top 3 of 4 underlyings")
+    assert "AND p.strategy_name IN ('Derivs Risk', 'ADSD', 'AD Hedge Co')" in bq.sqls[0]
     # BTC aggregated over OPTIONS + SPOT, mix column spot/opt/fut
     assert "| BTC | btc | $7,426,818,441 | -$102,879,489 | $6,788,428 | $166,691 | -$467,476 | -$35,352 | -$17,358,829 | 40/2068/0 | 10% |" in out
     # top 3 by gross notional: BTC, USDC, PAXG (HYPE at $623K is cut)
@@ -474,7 +486,7 @@ def test_positions_for_symbol_with_live_spot(fake):
     bq = fake(frames={"fct_otc_haruko_pnl_position_history_eod": _btc_breakdown_frame,
                       "fct_otc_haruko_position_summary": _btc_live_spot_frame})
     out = get_desk_positions_by_symbol.invoke({"symbol": "BTC-PERP"})
-    assert out.startswith("### Desk exposure in BTC (Haruko EOD 2026-09-09 23:58 UTC, all entities)")
+    assert out.startswith("### Desk exposure in BTC (Haruko EOD 2026-09-09 23:58 UTC, Derivs Risk, ADSD and AD Hedge Co)")
     assert "total: 976 positions, gross notional $2,891,861,584, net delta -$376,645,576 (short)" in out
     assert "valid pricers 9.3%" in out
     assert "live reconciled position (2026-09-10 19:53 UTC): spot 17,698.98 BTC (delta value -$21,990,262, Partially Reconciled" in out
@@ -506,6 +518,9 @@ def test_otc_trades(fake):
     assert "| CANCELED | SELL | ETH/USD PUT | 150 | $330,000 | 2,200 | 5.7022 QUOTE |" in out
     assert "INTERVAL 14 DAY" in bq.sqls[0] and "LIMIT 5" in bq.sqls[0]
     assert "dim_otcderivatives_accounts" in bq.sqls[0] and "dim_otcderivatives_entities" in bq.sqls[0]
+    uuid_filter = ("AND t.entity_id IN ('00000000-0000-0000-0000-000000000020', '00000000-0000-0000-0000-000000000086', "
+                   "'00000000-0000-0000-0000-000000000087')")
+    assert uuid_filter in bq.sqls[0] and uuid_filter in bq.sqls[1] and "_Scope:" in out
     fake(empty=True)
     assert "No OTC derivatives trades executed in the last 30 days" in get_otc_derivatives_trades.invoke({})
 
@@ -600,8 +615,36 @@ def test_query_desk_data_result_table_and_cap(fake):
     assert out.count("| 2026-09-10 |") == 40
     assert "Bytes scanned: 4.00 KB." in out
     assert bq.sqls[0].endswith("LIMIT 200")
+    assert "WARNING" not in out                                 # entity_id is in the query
     fake(empty=True)
     assert "Query returned no rows" in query_desk_data.invoke({"sql": "SELECT 1 FROM `anc-global-markets.pricing.current_price`"})
+
+
+def test_query_desk_data_warns_when_haruko_sql_has_no_portfolio_filter(fake):
+    bq = fake(frames={"fct_otc_haruko_pnl_portfolio_history_eod": lambda: pd.DataFrame({"n": [1]})})
+    out = query_desk_data.invoke({"sql": "SELECT COUNT(*) AS n FROM "
+                                         "`anc-global-markets.brokerage_a1.fct_otc_haruko_pnl_portfolio_history_eod`"})
+    assert "WARNING: this query reads a Haruko / OTC table without a portfolio filter" in out
+    assert "entity_id IN (20, 86, 87)" in out and "strategy_name IN ('Derivs Risk', 'ADSD', 'AD Hedge Co')" in out
+    assert "_Scope:" not in out                                 # free-form SQL gets the warning, not the footer
+    fake(frames={"intraday_price": lambda: pd.DataFrame({"n": [1]})})
+    out = query_desk_data.invoke({"sql": "SELECT COUNT(*) AS n FROM `anc-global-markets.pricing.intraday_price`"})
+    assert "WARNING" not in out                                 # not a desk table
+
+
+def test_desk_scope_env_overrides(monkeypatch):
+    from providers import desk_scope as ds
+    monkeypatch.setenv("DESK_PORTFOLIOS", "Derivs Risk")
+    monkeypatch.setenv("DESK_ENTITY_IDS", "20")
+    assert ds.portfolios() == ("Derivs Risk",) and ds.entity_ids() == (20,)
+    assert ds.entity_sql() == "entity_id IN (20)" and ds.strategy_sql("p.strategy_name") == "p.strategy_name IN ('Derivs Risk')"
+    assert ds.scope_label() == "Derivs Risk" and "has no rows" not in ds.scope_note()
+    monkeypatch.setenv("DESK_PORTFOLIOS", "Derivs'; DROP TABLE x; --")
+    with pytest.raises(ValueError):
+        ds.portfolios()
+    monkeypatch.setenv("DESK_ENTITY_IDS", "20,abc")
+    with pytest.raises(ValueError):
+        ds.entity_ids()
 
 
 def test_query_desk_data_surfaces_bigquery_errors(fake):

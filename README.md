@@ -484,8 +484,14 @@ while curl silently falls back. On this machine `/etc/gai.conf` also carries
 
 The chat agent and the Slack bot can also read the Global Markets desk's own book from
 BigQuery, read-only: Haruko PnL / greeks / positions (options, futures, perps, spot
-balances for **A1 Ltd** - entity 20 - and **ADSD**, Anchorage Digital Swap Dealer - entity
-86), the OTC derivatives blotter, live Talos orders and the internal price feed.
+balances), the OTC derivatives blotter, live Talos orders and the internal price feed.
+**Scope:** the derivatives desk is exactly three Haruko portfolios - **Derivs Risk** (entity
+20, A1 Ltd), **ADSD** (86, Anchorage Digital Swap Dealer) and **AD Hedge Co** (87) - and every
+desk query filters to them (`providers/desk_scope.py`: `entity_id IN (20, 86, 87)` on the
+portfolio / greeks tables, `strategy_name IN (...)` on position-level tables including the EOW
+script, the UUID form on the OTC blotter) and appends a scope footer; `query_desk_data` warns
+when hand-written SQL lacks the filter. Env `DESK_PORTFOLIOS` / `DESK_ENTITY_IDS` override the
+lists. The BigQuery export carries entities 20 and 86 only (87 has no rows yet, 2026-09-18).
 Implementation: `providers/bigquery.py` (`DeskBigQuery`), `tools/desk_tools.py`
 (`get_desk_tools()`, registered next to `get_chat_tools()` by `chat.default_tools()`),
 prompt section "Desk data (BigQuery)" in `prompts/chat_assistant_prompt.md`.
@@ -504,7 +510,7 @@ Table metadata comes from the table API (works with these grants) and is cached 
 | `BQ_DATA_PROJECT` | `anc-global-markets` | where the tables live |
 | `BQ_BILLING_PROJECT` | `anchorage-corp-eng-playground` | jobs run + are billed here |
 | `BQ_ALLOWED_DATASETS` | `brokerage_a1,pricing` | the only datasets SQL may reference |
-| `BQ_MAX_BYTES_BILLED` | `20000000000` (20 GB) | `maximum_bytes_billed` on every job. Raised from 2 GB on 2026-09-11 so Carson Levy's EOW derivatives PnL script (`get_derivs_pnl_eod`, ~15 GB per run, ~$0.08) can run live; 20 GB is ~$0.13 worst case per query at $6.25/TB |
+| `BQ_MAX_BYTES_BILLED` | `30000000000` (30 GB) | `maximum_bytes_billed` on every job. Raised from 2 GB on 2026-09-11 so Carson Levy's EOW derivatives PnL script (`get_derivs_pnl_eod`) can run live, and to 30 GB on 2026-09-18 when the desk portfolio filter (reading `strategy_name`) took the scan from ~15 GB to ~21 GB (~$0.13); 30 GB is ~$0.19 worst case per query at $6.25/TB |
 | `BQ_MAX_ROWS` | `200` | `LIMIT` appended / lowered on every query |
 | `BQ_TIMEOUT_S` | `60` | query timeout |
 | `BQ_CATALOG_PATH` | `data/bq_catalog.json` | schema cache (TTL 24 h) |
@@ -530,7 +536,7 @@ partitioned `fct_otc_haruko_pnl_position_history_eod` (a few MB per day) instead
 | Tool | Source | Answers |
 |---|---|---|
 | `get_desk_risk_snapshot()` | `fct_otc_haruko_pnl_portfolio` (snapshot every ~5 min) | positions/venues/assets, gross & net notional, equity, day/WTD/MTD/QTD/YTD/LTD PnL, funding, fees, delta/gamma/vega/theta USD, risk levels, large-change flags, data quality; per entity + combined |
-| `get_derivs_pnl_eod(period, include_daily)` | `fct_otc_haruko_position_pnl_history` + `fct_otcderivatives_trades` via `sql/haruko_eod_pnl.sql` (Carson Levy / Nayshil Dalal's EOW query, run live by `providers/haruko_eod.py`) | **authoritative derivatives PnL by period** - `mtd`, `wtd`, `ytd` (Haruko YTD column and LTD change since first snapshot, both), `last_week`, `last_month`, `month:YYYY-MM`, `range:A..B`: 3pm America/Chicago EOD cut, one full-book snapshot/day, PnL = life-to-date differences (never Haruko's month_to_date column, which resets mid-month); monthly table, optional daily rows, staleness warning, coverage note; ~15 GB / ~45 s cold, in-process cache 15 min + BigQuery query cache. August 2026 = $2,174,523, reconciled with the EOW report 2026-09-11 |
+| `get_derivs_pnl_eod(period, include_daily)` | `fct_otc_haruko_position_pnl_history` + `fct_otcderivatives_trades` via `sql/haruko_eod_pnl.sql` (Carson Levy / Nayshil Dalal's EOW query, run live by `providers/haruko_eod.py`) | **authoritative derivatives PnL by period** - `mtd`, `wtd`, `ytd` (Haruko YTD column and LTD change since first snapshot, both), `last_week`, `last_month`, `month:YYYY-MM`, `range:A..B`: 3pm America/Chicago EOD cut, one full-book snapshot/day, PnL = life-to-date differences (never Haruko's month_to_date column, which resets mid-month); monthly table, optional daily rows, staleness warning, coverage note; ~21 GB / ~45 s cold, in-process cache 15 min + BigQuery query cache. August 2026 = $2,174,523, reconciled with the EOW report 2026-09-11 |
 | `get_desk_pnl_history(days, by)` | `fct_otc_haruko_pnl_portfolio_history_eod` / `..._position_history_eod` | daily EOD PnL series at portfolio level (<= 90 d) or pivoted by strategy / venue (<= 28 d) |
 | `get_desk_greeks_history(days)` | `fct_otc_haruko_greeks_history_eod` | daily EOD delta / gamma / vega / theta per entity |
 | `get_perp_positions(top_n)` | FUTURES rows of `..._position_history_eod` + live `fct_otc_haruko_position_summary` | perps and dated futures: side, size, notional, avg vs mark, open/day PnL, funding (day, LTD), delta, live qty; maps symbols to tokens for Amberdata cross-checks |

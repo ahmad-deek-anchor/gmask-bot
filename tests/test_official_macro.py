@@ -117,7 +117,11 @@ def test_vix_history_parses_and_windows(feeds, session):
     assert len(year) > 240 and sum(1 for u, _ in session.calls if u == om.CBOE_VIX_URL) == 1   # one download, memoised
 
 
-def test_get_treasury_curve_tool(feeds):
+def test_get_treasury_curve_tool(feeds, monkeypatch):
+    # The tool calls curve() without a `today`, so the provider would use the real clock and the
+    # 1-week / 1-month change columns would drift as the calendar moves past the fixture's TODAY.
+    t, _ = feeds
+    monkeypatch.setattr(t, "curve", lambda days=30, today=None: TreasuryCurve.curve(t, days=days, today=TODAY))
     out = mac.get_treasury_curve.invoke({"days": 30})
     assert out.startswith("### US Treasury par yield curve as of 2026-09-16 (US Treasury daily publication)")
     assert "| 10y | 4.82% | +1 bp | +5 bp | +20 bp |" in out

@@ -112,7 +112,7 @@ def test_history_haruko_default_entity_combined(store):
 
 def test_history_entity_aliases_and_days(store):
     out = get_snapshot_history.invoke({"source": "haruko", "metric": "delta_usd", "entity": "A1", "days": 2})
-    assert "**haruko / A1 Ltd (entity 20) / delta_usd** - 2 daily snapshot(s), 2026-09-10 to 2026-09-11" in out
+    assert "**haruko / Derivs Risk (entity 20) / delta_usd** - 2 daily snapshot(s), 2026-09-10 to 2026-09-11" in out
     assert "-$56,000,000" in out
     assert get_snapshot_history.invoke({"source": "haruko", "metric": "delta_usd", "entity": "adsd"}).startswith(
         "No `haruko` snapshots for entity `86`")
@@ -195,7 +195,7 @@ def test_list_metrics_all_sources(store):
     out = list_snapshot_metrics.invoke({})
     assert "**haruko** - latest snapshot: 2026-09-11" in out
     assert "- combined desk: data_quality_flag, delta_usd, valid_pricer_pct" in out
-    assert "- A1 Ltd (entity 20): delta_usd" in out
+    assert "- Derivs Risk (entity 20): delta_usd" in out
     assert "**signals** - latest snapshot: 2026-09-11" in out
     assert "- tokens (2): btc, eth" in out and "- metrics (3): funding_rate, price, spot_volume_z" in out
     assert "**sheet**" in out and "- TOTAL: mtd_pnl_usd" in out and "- A1: mtd_take_rate_bps" in out

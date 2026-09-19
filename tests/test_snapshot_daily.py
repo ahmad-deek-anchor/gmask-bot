@@ -20,6 +20,7 @@ from snapshot_daily import (
     Row,
     SourceResult,
     capture_haruko,
+    capture_derivs,
     capture_sheet,
     capture_signals,
     main,
@@ -479,7 +480,7 @@ def test_capture_cme_rows_per_contract_and_aggregate():
 
 
 def test_run_includes_new_sources_and_cli_accepts_them(monkeypatch):
-    assert sd.SOURCES == ("haruko", "signals", "sheet", "etf", "cme") and set(sd.CAPTURES) == set(sd.SOURCES)
+    assert sd.SOURCES == ("haruko", "signals", "sheet", "etf", "cme", "derivs") and set(sd.CAPTURES) == set(sd.SOURCES)
     store = FakeSnapshotStore()
     caps = {"etf": lambda: sd.capture_etf(messari=FakeMessari(), spot=FakeSpot()),
             "cme": lambda: sd.capture_cme(spot=FakeSpot(), bases=("btc",))}
@@ -490,3 +491,89 @@ def test_run_includes_new_sources_and_cli_accepts_them(monkeypatch):
     monkeypatch.setattr(sd, "_get_store", lambda: store)
     monkeypatch.setattr(sd, "CAPTURES", caps)
     assert main(["--sources", "etf,cme", "--date", "2026-09-11", "--dry-run"]) == 0
+
+
+# ----------------------------------------------------------------------------
+# derivs (EOW period PnL)
+# ----------------------------------------------------------------------------
+
+class FakeEod:
+    """Stand-in for providers.haruko_eod.HarukoEodPnl with two periods and two months."""
+
+    def __init__(self, empty=False):
+        self.empty = empty
+        self.frames = 0
+
+    def frame(self):
+        self.frames += 1
+        if self.empty:
+            return pd.DataFrame()
+        return pd.DataFrame({"eod_date": [date(2026, 8, 31), date(2026, 9, 18)], "ltd_pnl": [13_047_215.0, 14_161_494.0]})
+
+    def latest(self, df=None):
+        return {"eod_date": date(2026, 9, 18), "ltd_pnl": 14_161_494.0, "daily_pnl": 595_604.0,
+                "n_positions": 2604, "business_days_behind": 0, "stale": False}
+
+    def period(self, kind, df=None):
+        from providers.haruko_eod import PeriodResult
+        if kind == "last_week":
+            raise RuntimeError("no rows in that week")
+        pnl = {"wtd": 158_165.0, "mtd": 1_114_278.0, "ytd": 11_310_865.0, "last_month": 2_174_523.0}[kind]
+        return PeriodResult(kind=kind, label=kind.upper(), start=date(2026, 9, 1), end=date(2026, 9, 18),
+                            baseline_date=date(2026, 8, 31), baseline_ltd=13_047_215.0, end_ltd=14_161_494.0,
+                            pnl=pnl, n_days=18, from_first_row=False, daily=pd.DataFrame(),
+                            ytd_sum=11_334_981.0 if kind == "ytd" else None,
+                            ytd_ltd_change=11_310_865.0 if kind == "ytd" else None)
+
+    def monthly(self, df=None):
+        return pd.DataFrame([
+            {"month": "2026-08", "start": date(2026, 8, 1), "end": date(2026, 8, 31), "baseline": date(2026, 7, 31),
+             "pnl": 2_174_523.0, "n_days": 31, "from_first_row": False, "partial": False, "haruko_mtd": -18_923.0,
+             "notional_quote": 4.155e9, "n_trades": 526},
+            {"month": "2026-09", "start": date(2026, 9, 1), "end": date(2026, 9, 18), "baseline": date(2026, 8, 31),
+             "pnl": 1_114_278.0, "n_days": 18, "from_first_row": False, "partial": True, "haruko_mtd": 1_177_138.0,
+             "notional_quote": 1.038e9, "n_trades": 135},
+        ])
+
+
+def test_capture_derivs_periods_months_and_latest():
+    res = capture_derivs(FakeEod())
+    assert res.ok and res.calls == {"bigquery_queries": 1}
+    by = {(r.entity, r.metric): r for r in res.rows}
+    assert by[("mtd", "pnl_usd")].value == 1_114_278.0
+    assert by[("wtd", "pnl_usd")].value == 158_165.0
+    assert by[("2026-08", "pnl_usd")].value == 2_174_523.0
+    assert by[("2026-09", "otc_trades")].value == 135.0
+    assert by[("latest", "ltd_pnl_usd")].value == 14_161_494.0
+    assert by[("latest", "day_pnl_usd")].value == 595_604.0
+    assert by[("latest", "n_positions")].value == 2604.0
+    # ytd carries both readings
+    assert by[("ytd", "pnl_usd")].value == 11_310_865.0
+    assert by[("ytd", "haruko_ytd_column_usd")].value == 11_334_981.0
+    assert by[("ytd", "ltd_change_usd")].value == 11_310_865.0
+    # a period with no rows is skipped, not fatal
+    assert ("last_week", "pnl_usd") not in by
+    # provenance: method + the three portfolios + the as-of EOD date
+    meta = json.loads(by[("mtd", "pnl_usd")].value_json)
+    assert meta["portfolios"] == ["Derivs Risk", "ADSD", "AD Hedge Co"]
+    assert meta["eod_to"] == "2026-09-18" and meta["eod_from"] == "2026-08-31" and meta["eod_days"] == 18
+    assert "EOW method" in meta["method"]
+    assert json.loads(by[("2026-09", "pnl_usd")].value_json)["partial"] is True
+
+
+def test_capture_derivs_errors():
+    with pytest.raises(RuntimeError, match="No EOD rows"):
+        capture_derivs(FakeEod(empty=True))
+
+
+def test_derivs_is_a_registered_source_and_gated_as_confidential():
+    import pathlib
+
+    import yaml
+    assert "derivs" in sd.SOURCES and sd.CAPTURES["derivs"] is capture_derivs
+    from tools.snapshot_tools import SOURCES as TOOL_SOURCES, DEFAULT_ENTITY, _entity
+    assert "derivs" in TOOL_SOURCES and DEFAULT_ENTITY["derivs"] == "mtd"
+    assert _entity("derivs", "this month") == "mtd" and _entity("derivs", "2026-08") == "2026-08"
+    policy = yaml.safe_load(pathlib.Path(__file__).resolve().parent.parent.joinpath("access", "policy.yaml").read_text())
+    rule = [r for r in policy["argument_rules"] if "get_snapshot_history" in (r.get("tools") or [])][0]
+    assert set(rule["values"]) == {"haruko", "sheet", "derivs"} and rule["requires_group"] == "desk_risk"

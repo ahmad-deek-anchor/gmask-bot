@@ -12,7 +12,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/home/ahmaddeek/program/signals-main
-ExecStart=/home/ahmaddeek/program/signals-main/.venv/bin/python snapshot_daily.py --sources haruko,sheet --verbose
+ExecStart=/home/ahmaddeek/program/signals-main/.venv/bin/python snapshot_daily.py --sources haruko,sheet,derivs --verbose
 Environment=PYTHONUNBUFFERED=1
 # .env carries SNAPSHOT_BACKEND=bigquery (and any MEMORY_DB_URL / SNAPSHOT_BQ_TABLE override);
 # snapshot_daily.py also load_dotenv()s it itself, this just keeps systemd's view identical.

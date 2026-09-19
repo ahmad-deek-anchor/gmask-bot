@@ -65,7 +65,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 logger = logging.getLogger("snapshot_daily")
 
-SOURCES = ("haruko", "signals", "sheet", "etf", "cme")
+SOURCES = ("haruko", "signals", "sheet", "etf", "cme", "derivs")
 SIGNALS_DAYS = 45
 CME_SNAPSHOT_BASES = ("btc", "eth", "sol", "xrp")
 ETF_ASSET_METRICS = ("spot_aum_usd", "spot_flow_usd", "spot_products", "futures_aum_usd", "futures_flow_usd",
@@ -97,6 +97,17 @@ HARUKO_EXTRA_COLS = ("position_timestamp", "entity_id", "valid_pricer_pct", "val
 HARUKO_ENTITIES = {eid: str(eid) for eid in __import__("providers.desk_scope", fromlist=["entity_ids"]).entity_ids()}
 COMBINED = "combined"
 NORMAL_FLAG = "normal"
+
+# ---------------------------------------------------------------------------
+# derivs (BigQuery, EOW method) - the authoritative period PnL
+# ---------------------------------------------------------------------------
+
+# Periods captured every night as their own snapshot entity, plus one row per calendar
+# month of the covered year and a `latest` entity for the last EOD row. This is the same
+# figure get_derivs_pnl_eod returns live; the snapshot exists so the bot can answer PnL
+# questions from the store it can always read, even when the Haruko datasets are not
+# reachable with the caller's credentials (see prompts/chat_assistant_prompt.md, "PnL").
+DERIVS_PERIODS = ("wtd", "mtd", "ytd", "last_week", "last_month")
 
 # sheet entities as the dashboard names them
 SHEET_ENTITIES = ("HOLD", "A1", "TOTAL")
@@ -559,12 +570,87 @@ def capture_cme(spot=None, bases: Sequence[str] = CME_SNAPSHOT_BASES) -> SourceR
 # orchestration
 # ---------------------------------------------------------------------------
 
+def _get_haruko_eod():
+    from providers.haruko_eod import HarukoEodPnl
+    bq = _get_bq()
+    if bq is None:
+        raise RuntimeError("Desk data (BigQuery) unavailable: no client / ADC")
+    return HarukoEodPnl(bq)
+
+
+def capture_derivs(eod=None) -> SourceResult:
+    """Authoritative derivatives PnL by period (Carson Levy EOW method, sql/haruko_eod_pnl.sql).
+
+    One entity per period (`wtd`, `mtd`, `ytd`, `last_week`, `last_month`), one per calendar
+    month (`YYYY-MM`) and `latest` for the final EOD row. Scope is the desk's three portfolios
+    (providers.desk_scope), exactly as the live tool reports it.
+    """
+    res = SourceResult("derivs")
+    h = eod if eod is not None else _get_haruko_eod()
+    df = h.frame()
+    res.calls["bigquery_queries"] = 1
+    if df is None or df.empty:
+        raise RuntimeError("No EOD rows from the Haruko EOW query")
+
+    from providers.desk_scope import portfolios
+    from providers.haruko_eod import METHOD_LINE          # imported lazily: this module stays stdlib-only
+    scope = list(portfolios())
+    latest = h.latest(df)
+    eod_to = _iso(latest.get("eod_date"))
+    base = {"method": METHOD_LINE, "portfolios": scope, "eod_to": eod_to}
+
+    for kind in DERIVS_PERIODS:
+        try:
+            r = h.period(kind, df)
+        except Exception as e:  # noqa: BLE001 - a period with no rows must not fail the source
+            logger.warning("derivs: period %s unavailable: %s", kind, e)
+            continue
+        if r.pnl is None:
+            continue
+        meta = dict(base, label=r.label, eod_from=_iso(r.baseline_date), eod_days=r.n_days,
+                    from_first_row=bool(r.from_first_row))
+        res.rows.append(Row(kind, "pnl_usd", float(r.pnl), _dumps(meta)))
+        if kind == "ytd":
+            if r.ytd_sum is not None:
+                res.rows.append(Row(kind, "haruko_ytd_column_usd", float(r.ytd_sum), _dumps(meta)))
+            if r.ytd_ltd_change is not None:
+                res.rows.append(Row(kind, "ltd_change_usd", float(r.ytd_ltd_change), _dumps(meta)))
+
+    months = h.monthly(df)
+    for m in months.itertuples(index=False):
+        if m.pnl is None or (isinstance(m.pnl, float) and math.isnan(m.pnl)):
+            continue
+        meta = dict(base, eod_from=_iso(m.baseline), eod_days=int(m.n_days), partial=bool(m.partial),
+                    from_first_row=bool(m.from_first_row))
+        res.rows.append(Row(str(m.month), "pnl_usd", float(m.pnl), _dumps(meta)))
+        n_trades = _num(getattr(m, "n_trades", None))
+        notional = _num(getattr(m, "notional_quote", None))
+        if n_trades is not None:
+            res.rows.append(Row(str(m.month), "otc_trades", n_trades, _dumps(meta)))
+        if notional is not None:
+            res.rows.append(Row(str(m.month), "otc_notional_usd", notional, _dumps(meta)))
+
+    ltd = _num(latest.get("ltd_pnl"))
+    if ltd is not None:
+        res.rows.append(Row("latest", "ltd_pnl_usd", ltd, _dumps(dict(base, eod_date=eod_to))))
+    day = _num(latest.get("daily_pnl"))
+    if day is not None:
+        res.rows.append(Row("latest", "day_pnl_usd", day, _dumps(dict(base, eod_date=eod_to))))
+    npos = _num(latest.get("n_positions"))
+    if npos is not None:
+        res.rows.append(Row("latest", "n_positions", npos, _dumps(dict(base, eod_date=eod_to))))
+    res.rows.append(Row("latest", "business_days_behind", float(latest.get("business_days_behind") or 0),
+                        _dumps(dict(base, eod_date=eod_to, stale=bool(latest.get("stale"))))))
+    return res
+
+
 CAPTURES: Dict[str, Callable[[], SourceResult]] = {
     "haruko": capture_haruko,
     "signals": capture_signals,
     "sheet": capture_sheet,
     "etf": capture_etf,
     "cme": capture_cme,
+    "derivs": capture_derivs,
 }
 
 

@@ -160,7 +160,7 @@ argument_rules:
     requires_group: memory_shared
   - tools: [get_snapshot_history, compare_to_snapshot, list_snapshot_metrics]
     argument: source
-    values: [haruko, sheet]
+    values: [haruko, sheet, derivs]
     requires_group: desk_risk               # signals / etf / cme snapshots stay public
     confidential: true                      # and only in confidential places
 

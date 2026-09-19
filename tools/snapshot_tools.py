@@ -46,14 +46,21 @@ from tools.desk_tools import _md_table, _usd
 
 logger = logging.getLogger(__name__)
 
-SOURCES = ("haruko", "signals", "sheet", "etf", "cme")
-DEFAULT_ENTITY = {"haruko": "combined", "signals": None, "sheet": "TOTAL", "etf": "bitcoin", "cme": "btc"}
+SOURCES = ("haruko", "signals", "sheet", "etf", "cme", "derivs")
+DEFAULT_ENTITY = {"haruko": "combined", "signals": None, "sheet": "TOTAL", "etf": "bitcoin", "cme": "btc",
+                  "derivs": "mtd"}
 HARUKO_ALIASES = {
     "combined": "combined", "all": "combined", "desk": "combined", "total": "combined",
     "20": "20", "a1": "20", "a1 ltd": "20", "a1ltd": "20", "a1_ltd": "20",
     "86": "86", "adsd": "86", "swap dealer": "86",
 }
-HARUKO_LABELS = {"20": "A1 Ltd (entity 20)", "86": "ADSD (entity 86)", "combined": "combined desk"}
+HARUKO_LABELS = {"20": "Derivs Risk (entity 20)", "86": "ADSD (entity 86)", "87": "AD Hedge Co (entity 87)",
+                 "combined": "combined desk"}
+# `derivs` entities are periods, not books: month keys are "YYYY-MM".
+DERIVS_ALIASES = {"week": "wtd", "this week": "wtd", "wtd": "wtd", "month": "mtd", "this month": "mtd",
+                  "mtd": "mtd", "ytd": "ytd", "year": "ytd", "year to date": "ytd",
+                  "last week": "last_week", "last_week": "last_week",
+                  "last month": "last_month", "last_month": "last_month", "latest": "latest"}
 MAX_DAYS = 3650
 DEFAULT_DAYS = 30
 FALLBACK_DAYS = 31   # compare_to_snapshot: how far before the requested date to look for a snapshot
@@ -182,6 +189,8 @@ def _entity(source: str, entity: Optional[str]) -> Optional[str]:
         return DEFAULT_ENTITY[source]
     if source == "haruko":
         return HARUKO_ALIASES.get(e.lower(), e)
+    if source == "derivs":
+        return DERIVS_ALIASES.get(e.lower(), e.lower())     # periods: wtd / mtd / ytd / last_month / YYYY-MM
     if source == "sheet":
         return e.upper()
     if source == "cme":
@@ -257,18 +266,21 @@ def _no_data(source: str, entity: str, metric: str, days: int) -> str:
 
 @tool("get_snapshot_history")
 def get_snapshot_history(source: str, metric: str, entity: Optional[str] = None, days: int = DEFAULT_DAYS) -> str:
-    """Daily history of one snapshotted metric: desk risk from Haruko ('haruko': delta_usd, gamma_usd, vega, theta, day_pnl, ytd_pnl, gross_notional, equity, valid_pricer_pct, data_quality_flag), market signals per token ('signals': price, funding_rate, spot_volume, perp_oi, <metric>_z z-scores ...) or spot desk PnL from the sheet ('sheet': mtd_pnl_usd, ytd_pnl_usd, week_pnl_usd ...).
+    """Daily history of one snapshotted metric: authoritative derivatives PnL by period ('derivs': pnl_usd for entity 'mtd' / 'wtd' / 'ytd' / 'last_month' / 'YYYY-MM', plus otc_trades, otc_notional_usd, and 'latest' ltd_pnl_usd / day_pnl_usd), desk risk from Haruko ('haruko': delta_usd, gamma_usd, vega, theta, day_pnl, ytd_pnl, gross_notional, equity), spot desk PnL from the sheet ('sheet': mtd_pnl_usd, ytd_pnl_usd, week_pnl_usd, take rates) or market signals per token ('signals': price, funding_rate, perp_oi, <metric>_z).
 
-    Use for "how has the desk delta moved since the first snapshot / over the last
-    two weeks", "trend of BTC funding in our snapshots", "spot desk MTD PnL day by
-    day". Returns a compact date | value table plus change first -> last and min / max.
-    Snapshots are captured once a day by snapshot_daily.py; the series is only as long
-    as the collection history.
+    Use for "how has the desk delta moved over the last two weeks", "trend of BTC funding",
+    "spot desk MTD PnL day by day" - and as the **fallback for any PnL question when the live
+    tools (get_derivs_pnl_eod, the sheet tools) report that BigQuery or the sheet is not
+    reachable**: the same figures are captured here nightly with the desk's own credentials.
+    Returns a compact date | value table plus change first -> last and min / max. Snapshots are
+    captured once a day by snapshot_daily.py; the series is only as long as the collection history.
 
     Args:
-        source: 'haruko' | 'signals' | 'sheet' | 'etf' | 'cme'.
+        source: 'derivs' | 'haruko' | 'signals' | 'sheet' | 'etf' | 'cme'.
         metric: Snapshot metric name (see list_snapshot_metrics).
-        entity: haruko: 'combined' (default), '20' / 'a1' (A1 Ltd), '86' / 'adsd';
+        entity: derivs: a period - 'mtd' (default), 'wtd', 'ytd', 'last_week', 'last_month',
+            a month like '2026-08', or 'latest' for the last EOD row;
+            haruko: 'combined' (default), '20' / 'derivs risk', '86' / 'adsd', '87' / 'ad hedge co';
             signals: the token, e.g. 'btc' (required); sheet: 'TOTAL' (default), 'HOLD', 'A1';
             etf: 'bitcoin' (default), 'ethereum', 'solana', 'xrp', 'multi-asset';
             cme: 'btc' (default) / 'eth' / 'sol' / 'xrp' for the aggregate, or a contract symbol like 'BTCZ6'.
